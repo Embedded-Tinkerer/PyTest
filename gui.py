@@ -5,8 +5,8 @@ import math
 import csv
 import os
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QCheckBox,
-                             QHBoxLayout, QPushButton, QLabel, QLineEdit, QFormLayout, QTabWidget, QComboBox, QGroupBox, QFileDialog)
-from PyQt6.QtCore import QThread, pyqtSignal
+                             QHBoxLayout, QPushButton, QLabel, QLineEdit, QFormLayout, QTabWidget, QComboBox, QGroupBox, QFileDialog, QSplitter, QGridLayout)
+from PyQt6.QtCore import QThread, pyqtSignal, Qt
 import pyqtgraph as pg
 
 # Import your validated backend drivers
@@ -24,23 +24,197 @@ class VNASweepWorker(QThread):
     data_ready = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, pna_address):
+    def __init__(self, pna_address, vna_params, addresses, bias_params):
         super().__init__()
         self.pna_address = pna_address
+        self.params = vna_params
+        self.addr = addresses
+        self.bias = bias_params
 
     def run(self):
         try:
             rm = pyvisa.ResourceManager()
-            vna = VectorNetworkAnalyzer(self.pna_address)
             
+            # Initialize instruments
+            vna = VectorNetworkAnalyzer(self.pna_address)
+            gate, drain = None, None
+            vg_meas, ig_meas, vd_meas, id_meas = 0.0, 0.0, 0.0, 0.0
+
+            if self.bias['enable']:
+                gate = PowerSupply(self.addr['gate'], name="Gate_PSU")
+                drain = PowerSupply(self.addr['drain'], name="Drain_PSU")
+                if not all([gate.connect(rm), drain.connect(rm)]):
+                    raise Exception("Failed to connect to Power Supplies for S-Parameter Bias.")
+                
+                gate.reset()
+                drain.reset()
+                
+                # Apply Gate Pinch-Off first to prevent GaN burn-out
+                gate.configure_channel(1, self.bias['vg_start'], self.bias['vg_comp'])
+                gate.output_on(1)
+                time.sleep(0.5)
+                
+                # Apply Drain Voltage
+                drain.configure_channel(1, self.bias['vd'], self.bias['vd_comp'])
+                drain.output_on(1)
+                time.sleep(1.0)
+                
+                # Capture initial telemetry values
+                vg_meas = gate.measure_voltage(1)
+                ig_meas = gate.measure_current(1)
+                vd_meas = drain.measure_voltage(1)
+                id_meas = drain.measure_current(1)
+
             if vna.connect(rm):
+                # Clean start
                 vna.reset()
-                vna.setup_2port_s_parameters("1 GHz", "10 GHz", 201, -20.0)
+                
+                # Apply custom physical sweep rules to override standard drivers
+                vna.write(f"SENS1:FREQ:STAR {self.params['f_start']}")
+                vna.write(f"SENS1:FREQ:STOP {self.params['f_stop']}")
+                vna.write(f"SENS1:SWE:POIN {self.params['points']}")
+                vna.write(f"SENS1:BAND {self.params['ifbw']}")
+                vna.write(f"SOUR1:POW {self.params['power']}")
+                
+                # Setup Averaging
+                if self.params['avg_enable']:
+                    vna.write("SENS1:AVER ON")
+                    vna.write(f"SENS1:AVER:COUN {self.params['avg_factor']}")
+                else:
+                    vna.write("SENS1:AVER OFF")
+                
+                # Dynamic VISA Timeout Calculation to prevent CALC1:DATA? FDATA timeouts
+                points = int(self.params['points'])
+                ifbw = float(self.params['ifbw'])
+                avg_factor = int(self.params['avg_factor']) if self.params['avg_enable'] else 1
+                
+                # Calculate estimated physical sweep time. 2-port sweep takes both forward & reverse directions.
+                # Multiply by 2 safety factor and add margin.
+                estimated_sweep_time = 2 * avg_factor * (points / ifbw)
+                visa_timeout_ms = int(max(45, estimated_sweep_time * 2.0) * 1000)
+
+                # Set VISA timeout dynamically on any internal device wrappers
+                for attr in ['device', 'instrument', 'resource', 'instr']:
+                    if hasattr(vna, attr):
+                        res = getattr(vna, attr)
+                        if res and hasattr(res, 'timeout'):
+                            res.timeout = visa_timeout_ms
+                            break
+
+                # Delete old traces and set up clean, explicit S-parameter traces to prevent mismatch freezes
+                vna.write("CALC1:PAR:DEL:ALL")
+                vna.write("CALC1:PAR:EXT 'Meas_S11', 'S11'")
+                vna.write("CALC1:PAR:EXT 'Meas_S21', 'S21'")
+                vna.write("CALC1:PAR:EXT 'Meas_S12', 'S12'")
+                vna.write("CALC1:PAR:EXT 'Meas_S22', 'S22'")
+                
+                # Display them on Window 1
+                vna.write("DISP:WIND1:STATE ON")
+                vna.write("DISP:WIND1:TRAC1:FEED 'Meas_S11'")
+                vna.write("DISP:WIND1:TRAC2:FEED 'Meas_S21'")
+                vna.write("DISP:WIND1:TRAC3:FEED 'Meas_S12'")
+                vna.write("DISP:WIND1:TRAC4:FEED 'Meas_S22'")
+                
+                # Configure VNA output data format to ASCII
+                vna.write("FORM ASC,0")
                 vna.rf_on()
-                data_matrix = vna.measure_2port()
+                
+                # Put channel into HOLD before setting up trigger parameters
+                vna.write("SENS1:SWE:MODE HOLD")
+                
+                # Trigger the configured measurement
+                if self.params['avg_enable']:
+                    vna.write(f"SENS1:SWE:GRO:COUN {avg_factor}")
+                    vna.write("SENS1:SWE:MODE GROup")
+                else:
+                    vna.write("SENS1:SWE:MODE SINGle")
+                
+                start_time = time.time()
+                max_wait_time = max(60.0, estimated_sweep_time * 3.5)
+                while True:
+                    # Once a single/group sweep completes, PNA-X drops back to HOLD automatically
+                    mode = vna.query("SENS1:SWE:MODE?").strip().upper()
+                    if "HOLD" in mode:
+                        break
+                    if time.time() - start_time > max_wait_time:
+                        raise TimeoutError("VNA sweep execution timed out on hardware.")
+                    time.sleep(0.2)
+                
+                # Pull back raw trace data sequentially
+                raw_data = {}
+                s_params = ["S11", "S21", "S12", "S22"]
+                for param in s_params:
+                    trace_name = f"Meas_{param}"
+                    vna.write(f"CALC1:PAR:SEL '{trace_name}'")
+                    data_str = vna.query("CALC1:DATA? FDATA")
+                    try:
+                        raw_data[param] = [float(x) for x in data_str.strip().split(",") if x]
+                    except Exception:
+                        raw_data[param] = []
+
+                # Clean shutoff
                 vna.rf_off()
                 vna.disconnect()
-                self.data_ready.emit(data_matrix)
+                
+                # Generate frequencies list
+                f_start = float(self.params['f_start'])
+                f_stop = float(self.params['f_stop'])
+                freqs_list = [f_start + i * (f_stop - f_start) / (points - 1) for i in range(points)] if points > 1 else [f_start]
+                raw_data["Frequency"] = freqs_list
+                
+                # Fetch S-parameter lists to compute stability
+                s11_list = raw_data.get("S11", [])
+                s21_list = raw_data.get("S21", [])
+                s12_list = raw_data.get("S12", [])
+                s22_list = raw_data.get("S22", [])
+                
+                k_factor_list = []
+                for i in range(len(s11_list)):
+                    try:
+                        s11 = s11_list[i]
+                        s12 = s12_list[i]
+                        s21 = s21_list[i]
+                        s22 = s22_list[i]
+                        
+                        # Handle complex parameters natively, fallback to dB magnitudes if needed
+                        if isinstance(s11, complex):
+                            m_s11 = abs(s11)
+                            m_s22 = abs(s22)
+                            m_s12 = abs(s12)
+                            m_s21 = abs(s21)
+                            delta = s11 * s22 - s12 * s21
+                            delta_mag = abs(delta)
+                        else:
+                            # Convert scalar dB points to absolute multipliers
+                            m_s11 = 10.0 ** (float(s11) / 20.0)
+                            m_s22 = 10.0 ** (float(s22) / 20.0)
+                            m_s12 = 10.0 ** (float(s12) / 20.0)
+                            m_s21 = 10.0 ** (float(s21) / 20.0)
+                            delta_mag = abs(m_s11 * m_s22 - m_s12 * m_s21)
+                        
+                        num = 1.0 - (m_s11 ** 2) - (m_s22 ** 2) + (delta_mag ** 2)
+                        den = 2.0 * abs(m_s12 * m_s21)
+                        
+                        k = num / den if den != 0 else float('nan')
+                        k_factor_list.append(k)
+                    except Exception:
+                        k_factor_list.append(float('nan'))
+                        
+                raw_data["K_Factor"] = k_factor_list
+                
+                raw_data["Vg_meas"] = vg_meas
+                raw_data["Ig_meas"] = ig_meas
+                raw_data["Vd_meas"] = vd_meas
+                raw_data["Id_meas"] = id_meas
+                
+                if self.bias['enable']:
+                    drain.output_off(1)
+                    time.sleep(0.5)
+                    gate.output_off(1)
+                    gate.disconnect()
+                    drain.disconnect()
+
+                self.data_ready.emit(raw_data)
             else:
                 self.error_occurred.emit(f"Failed to connect to VNA at {self.pna_address}.")
         except Exception as e:
@@ -162,7 +336,7 @@ class GaNBiasWorker(QThread):
 
 class PulsedCompressionWorker(QThread):
     log_message = pyqtSignal(str)
-    data_ready = pyqtSignal(float, list, list, list) # Freq, Pin, Pout, PAE
+    data_ready = pyqtSignal(float, list, list, list, list, list, list, list) # Freq, Pin, Pout, PAE, Vg_meas, Ig_meas, Vd_meas, Id_meas
     sequence_complete = pyqtSignal()
     error_occurred = pyqtSignal(str)
 
@@ -202,20 +376,12 @@ class PulsedCompressionWorker(QThread):
                 drain.output_on(1)
                 time.sleep(1)
 
-            # 3. SETUP TIMING & MEASUREMENT MODE
             vna.setup_unratioed_power_measure()
             vna.write("SENS1:SWE:POIN 1") 
 
             if is_pulsed:
                 self.log_message.emit("Configuring Pulsed Mode...")
-                # Pass the new vhigh and vlow values directly to the WG configure method
-                wg.configure_pulse_trigger(
-                    self.pulse['width'], 
-                    self.pulse['period'], 
-                    self.pulse['delay'],
-                    self.pulse['vhigh'],
-                    self.pulse['vlow']
-                )
+                wg.configure_pulse_trigger(self.pulse['width'], self.pulse['period'], self.pulse['delay'])
                 scope.configure_trigger(self.pulse['trig_chan'], self.pulse['trig_level'])
                 scope.set_timebase(self.pulse['period'])
                 vna.write("TRIG:SOUR EXT") 
@@ -235,6 +401,7 @@ class PulsedCompressionWorker(QThread):
                 vna.set_cw_frequency(f"{freq} Hz")
                 
                 pin_results, pout_results, pae_results = [], [], []
+                vg_meas_results, ig_meas_results, vd_meas_results, id_meas_results = [], [], [], []
 
                 for pin in powers:
                     vna.set_power_level(pin)
@@ -255,6 +422,15 @@ class PulsedCompressionWorker(QThread):
                         if self.bias['enable']:
                             id_current = drain.measure_current(1)
                     
+                    # Read dynamic self-biasing DC telemetry from supply channels
+                    if self.bias['enable']:
+                        vg_val = gate.measure_voltage(1)
+                        ig_val = gate.measure_current(1)
+                        vd_val = drain.measure_voltage(1)
+                        id_val = id_current if is_pulsed else drain.measure_current(1)
+                    else:
+                        vg_val, ig_val, vd_val, id_val = 0.0, 0.0, 0.0, 0.0
+
                     if self.bias['enable'] and id_current > 0.001: 
                         pout_w = 10 ** ((pout - 30) / 10)
                         pin_w = 10 ** ((pin - 30) / 10)
@@ -266,8 +442,14 @@ class PulsedCompressionWorker(QThread):
                     pin_results.append(pin)
                     pout_results.append(pout)
                     pae_results.append(pae)
+                    
+                    vg_meas_results.append(vg_val)
+                    ig_meas_results.append(ig_val)
+                    vd_meas_results.append(vd_val)
+                    id_meas_results.append(id_val)
                 
-                self.data_ready.emit(freq, pin_results, pout_results, pae_results)
+                self.data_ready.emit(freq, pin_results, pout_results, pae_results,
+                                     vg_meas_results, ig_meas_results, vd_meas_results, id_meas_results)
 
             vna.rf_off()
             if self.bias['enable']:
@@ -448,6 +630,52 @@ class TestExecutiveGUI(QMainWindow):
     def build_vna_tab(self):
         layout = QVBoxLayout(self.tab_vna)
         
+        # Grid layout for VNA sweep configuration parameters
+        vna_cfg_group = QGroupBox("VNA Linear Parameters")
+        cfg_layout = QGridLayout()
+        
+        self.input_vna_fstart = QLineEdit("1e9")
+        self.input_vna_fstop = QLineEdit("10e9")
+        self.input_vna_points = QLineEdit("201")
+        self.input_vna_power = QLineEdit("-20.0")
+        self.input_vna_ifbw = QLineEdit("1000")
+        
+        cfg_layout.addWidget(QLabel("Start Freq (Hz):"), 0, 0)
+        cfg_layout.addWidget(self.input_vna_fstart, 0, 1)
+        cfg_layout.addWidget(QLabel("Stop Freq (Hz):"), 0, 2)
+        cfg_layout.addWidget(self.input_vna_fstop, 0, 3)
+        
+        cfg_layout.addWidget(QLabel("Points:"), 1, 0)
+        cfg_layout.addWidget(self.input_vna_points, 1, 1)
+        cfg_layout.addWidget(QLabel("RF Power (dBm):"), 1, 2)
+        cfg_layout.addWidget(self.input_vna_power, 1, 3)
+        
+        cfg_layout.addWidget(QLabel("IF Bandwidth (Hz):"), 2, 0)
+        cfg_layout.addWidget(self.input_vna_ifbw, 2, 1)
+        
+        vna_cfg_group.setLayout(cfg_layout)
+        layout.addWidget(vna_cfg_group)
+        
+        # Averaging Setup Group
+        avg_group = QGroupBox("VNA Averaging Setup")
+        avg_layout = QHBoxLayout()
+        self.check_vna_avg = QCheckBox("Enable Averaging")
+        self.input_vna_avg_factor = QLineEdit("16")
+        avg_layout.addWidget(self.check_vna_avg)
+        avg_layout.addWidget(QLabel("Averaging Factor:"))
+        avg_layout.addWidget(self.input_vna_avg_factor)
+        avg_group.setLayout(avg_layout)
+        layout.addWidget(avg_group)
+        
+        bias_setup_group = QGroupBox("S-Parameter DC Bias Control")
+        bias_setup_layout = QHBoxLayout()
+        self.check_vna_bias = QCheckBox("Enable DC Bias Sequence")
+        self.check_vna_bias.setChecked(True)
+        bias_setup_layout.addWidget(self.check_vna_bias)
+        bias_setup_group.setLayout(bias_setup_layout)
+        layout.addWidget(bias_setup_group)
+        
+        # Setup control triggers
         btn_layout = QHBoxLayout()
         self.btn_sweep = QPushButton("Trigger S-Parameter Sweep")
         self.btn_sweep.clicked.connect(self.trigger_vna_sweep)
@@ -460,10 +688,21 @@ class TestExecutiveGUI(QMainWindow):
 
         layout.addLayout(btn_layout)
 
-        self.plot_widget = pg.PlotWidget(title="Live S-Parameter Matrix")
+        # Split plot layout for showing S-Parameters and stability K-factor simultaneously
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        
+        self.plot_widget = pg.PlotWidget(title="Live S-Parameter Matrix (dB)")
         self.plot_widget.addLegend(offset=(10, 10))
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
-        layout.addWidget(self.plot_widget)
+        splitter.addWidget(self.plot_widget)
+        
+        self.k_plot_widget = pg.PlotWidget(title="Rollett Stability K-Factor (Linear)")
+        self.k_plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.k_plot_widget.setLabel('left', 'K', units='')
+        self.k_plot_widget.setLabel('bottom', 'Frequency', units='Hz')
+        splitter.addWidget(self.k_plot_widget)
+        
+        layout.addWidget(splitter)
 
     def build_bias_tab(self):
         layout = QVBoxLayout(self.tab_bias)
@@ -644,19 +883,54 @@ class TestExecutiveGUI(QMainWindow):
         self.btn_sweep.setEnabled(False)
         self.btn_export_vna.setEnabled(False)
         self.vna_results = None
-        self.vna_thread = VNASweepWorker(self.vna_combo.currentText())
+        
+        # Build the structured parameter dictionary for VNA sweep configuration
+        vna_params = {
+            'f_start': float(self.input_vna_fstart.text()),
+            'f_stop': float(self.input_vna_fstop.text()),
+            'points': int(self.input_vna_points.text()),
+            'power': float(self.input_vna_power.text()),
+            'ifbw': float(self.input_vna_ifbw.text()),
+            'avg_enable': self.check_vna_avg.isChecked(),
+            'avg_factor': int(self.input_vna_avg_factor.text())
+        }
+        
+        addresses = {
+            'gate': self.gate_combo.currentText(),
+            'drain': self.drain_combo.currentText()
+        }
+        
+        bias_params = {
+            'enable': self.check_vna_bias.isChecked(),
+            'vg_start': float(self.input_vg_start.text()),
+            'vg_comp': float(self.input_vg_comp.text()),
+            'vd': float(self.input_vd.text()),
+            'vd_comp': float(self.input_vd_comp.text())
+        }
+        
+        self.vna_thread = VNASweepWorker(self.vna_combo.currentText(), vna_params, addresses, bias_params)
         self.vna_thread.data_ready.connect(self.update_vna_plots)
         self.vna_thread.error_occurred.connect(self.handle_error)
         self.vna_thread.start()
 
     def update_vna_plots(self, data):
         self.plot_widget.clear()
+        self.k_plot_widget.clear()
+        
         self.vna_results = data
         
+        # Plot magnitudes on standard dB graph
         if "S11" in data: self.plot_widget.plot(data["S11"], pen='y', name="S11")
         if "S21" in data: self.plot_widget.plot(data["S21"], pen='g', name="S21")
         if "S12" in data: self.plot_widget.plot(data["S12"], pen='c', name="S12")
         if "S22" in data: self.plot_widget.plot(data["S22"], pen='m', name="S22")
+        
+        # Plot computed Rollett stability K-factor
+        if "K_Factor" in data:
+            self.k_plot_widget.plot(data["K_Factor"], pen=pg.mkPen('w', width=2), name="K-Factor")
+            # Draw a critical line at K = 1 representing the unconditional stability boundary
+            boundary_line = pg.InfiniteLine(pos=1.0, angle=0, pen=pg.mkPen('r', width=1.5, style=Qt.PenStyle.DashLine))
+            self.k_plot_widget.addItem(boundary_line)
         
         self.btn_sweep.setEnabled(True)
         self.btn_export_vna.setEnabled(True)
@@ -683,7 +957,8 @@ class TestExecutiveGUI(QMainWindow):
                     if not file_exists:
                         writer.writerow([
                             "Execution Timestamp", "Part Number", "Serial Number", "Lot Number",
-                            "Frequency (Hz)", "S11 (dB)", "S21 (dB)", "S12 (dB)", "S22 (dB)"
+                            "Frequency (Hz)", "S11 (dB)", "S21 (dB)", "S12 (dB)", "S22 (dB)", "K-Factor",
+                            "Gate Voltage (V)", "Gate Current (A)", "Drain Voltage (V)", "Drain Current (A)"
                         ])
                     
                     freqs = self.vna_results.get("Frequency", [])
@@ -691,11 +966,17 @@ class TestExecutiveGUI(QMainWindow):
                     s21 = self.vna_results.get("S21", [])
                     s12 = self.vna_results.get("S12", [])
                     s22 = self.vna_results.get("S22", [])
+                    k_factor = self.vna_results.get("K_Factor", [])
                     
+                    vg_val = self.vna_results.get("Vg_meas", 0.0)
+                    ig_val = self.vna_results.get("Ig_meas", 0.0)
+                    vd_val = self.vna_results.get("Vd_meas", 0.0)
+                    id_val = self.vna_results.get("Id_meas", 0.0)
+
                     num_points = max(len(s11), len(s21), len(s12), len(s22), len(freqs))
                     if len(freqs) == 0 and num_points > 0:
-                        f_start = 1e9
-                        f_stop = 10e9
+                        f_start = float(self.input_vna_fstart.text())
+                        f_stop = float(self.input_vna_fstop.text())
                         freqs = [f_start + i * (f_stop - f_start) / (num_points - 1) for i in range(num_points)] if num_points > 1 else [f_start]
 
                     row_count = 0
@@ -705,10 +986,12 @@ class TestExecutiveGUI(QMainWindow):
                         s21_val = s21[i] if i < len(s21) else ""
                         s12_val = s12[i] if i < len(s12) else ""
                         s22_val = s22[i] if i < len(s22) else ""
+                        k_val = k_factor[i] if i < len(k_factor) else ""
                         
                         writer.writerow([
                             timestamp, pn, sn, lot,
-                            f_val, s11_val, s21_val, s12_val, s22_val
+                            f_val, s11_val, s21_val, s12_val, s22_val, k_val,
+                            vg_val, ig_val, vd_val, id_val
                         ])
                         row_count += 1
                 
@@ -768,8 +1051,8 @@ class TestExecutiveGUI(QMainWindow):
             'width': float(self.input_width.text()),
             'period': float(self.input_period.text()),
             'delay': float(self.input_delay.text()),
-            'vhigh': float(self.input_vhigh.text()), # Passed voltage high configuration
-            'vlow': float(self.input_vlow.text()),   # Passed voltage low configuration
+            'vhigh': float(self.input_vhigh.text()), 
+            'vlow': float(self.input_vlow.text()),   
             'trig_chan': 1,
             'trig_level': 0.5,
             'scope_chan': 1,
@@ -796,12 +1079,16 @@ class TestExecutiveGUI(QMainWindow):
         self.comp_thread.error_occurred.connect(self.handle_error)
         self.comp_thread.start()
 
-    def update_comp_plot(self, freq, pin, pout, pae):
+    def update_comp_plot(self, freq, pin, pout, pae, vg_m, ig_m, vd_m, id_m):
         self.compression_results.append({
             'frequency': freq,
             'pin': pin,
             'pout': pout,
-            'pae': pae
+            'pae': pae,
+            'vg_m': vg_m,
+            'ig_m': ig_m,
+            'vd_m': vd_m,
+            'id_m': id_m
         })
         
         self.comp_plot.clear() 
@@ -835,7 +1122,8 @@ class TestExecutiveGUI(QMainWindow):
                     if not file_exists:
                         writer.writerow([
                             "Execution Timestamp", "Part Number", "Serial Number", "Lot Number",
-                            "Frequency (Hz)", "Input Power (dBm)", "Output Power (dBm)", "Power Added Efficiency (%)"
+                            "Frequency (Hz)", "Input Power (dBm)", "Output Power (dBm)", "Power Added Efficiency (%)",
+                            "Gate Voltage (V)", "Gate Current (A)", "Drain Voltage (V)", "Drain Current (A)"
                         ])
                     
                     row_count = 0
@@ -844,10 +1132,16 @@ class TestExecutiveGUI(QMainWindow):
                         pins = sweep['pin']
                         pouts = sweep['pout']
                         paes = sweep['pae']
+                        vgs = sweep['vg_m']
+                        igs = sweep['ig_m']
+                        vds = sweep['vd_m']
+                        ids = sweep['id_m']
+                        
                         for i in range(len(pins)):
                             writer.writerow([
                                 timestamp, pn, sn, lot,
-                                f_hz, pins[i], pouts[i], paes[i]
+                                f_hz, pins[i], pouts[i], paes[i],
+                                vgs[i], igs[i], vds[i], ids[i]
                             ])
                             row_count += 1
                 
