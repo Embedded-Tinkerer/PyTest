@@ -1,0 +1,780 @@
+import sys
+import pyvisa
+import time
+import math
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QCheckBox,
+                             QHBoxLayout, QPushButton, QLabel, QLineEdit, QFormLayout, QTabWidget, QComboBox, QGroupBox)
+from PyQt6.QtCore import QThread, pyqtSignal
+import pyqtgraph as pg
+
+# Import your validated backend drivers
+from vna import VectorNetworkAnalyzer
+from power_supply import PowerSupply
+from spectrum_analyzer import SignalAnalyzer
+from waveform_gen import WaveformGenerator
+from oscilloscope import Oscilloscope
+
+# =============================================================================
+# BACKGROUND WORKER THREADS (The Controller Layer)
+# =============================================================================
+
+class VNASweepWorker(QThread):
+    data_ready = pyqtSignal(dict)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, pna_address):
+        super().__init__()
+        self.pna_address = pna_address
+
+    def run(self):
+        try:
+            rm = pyvisa.ResourceManager()
+            vna = VectorNetworkAnalyzer(self.pna_address)
+            
+            if vna.connect(rm):
+                vna.reset()
+                vna.setup_2port_s_parameters("1 GHz", "10 GHz", 201, -20.0)
+                vna.rf_on()
+                data_matrix = vna.measure_2port()
+                vna.rf_off()
+                vna.disconnect()
+                self.data_ready.emit(data_matrix)
+            else:
+                self.error_occurred.emit(f"Failed to connect to VNA at {self.pna_address}.")
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+
+class GaNBiasWorker(QThread):
+    log_message = pyqtSignal(str)
+    telemetry_update = pyqtSignal(float, float, float)
+    sequence_complete = pyqtSignal()
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, addresses, bias_params):
+        super().__init__()
+        self.addr = addresses
+        self.params = bias_params
+
+    def run(self):
+        try:
+            rm = pyvisa.ResourceManager()
+            gate = PowerSupply(self.addr['gate'], name="Gate_PSU")
+            drain = PowerSupply(self.addr['drain'], name="Drain_PSU")
+
+            instruments = [gate.connect(rm), drain.connect(rm)]
+            scope = None
+
+            if self.params['target_mode']:
+                scope = Oscilloscope(self.addr['scope'])
+                instruments.append(scope.connect(rm))
+
+            if not all(instruments):
+                self.error_occurred.emit("Failed to connect to Power Supplies (or Scope).")
+                return
+
+            gate.reset()
+            drain.reset()
+
+            self.log_message.emit("Applying Gate Pinch-Off Voltage...")
+            current_vg = self.params['vg_start']
+            gate.configure_channel(1, current_vg, self.params['vg_comp'])
+            gate.output_on(1)
+            time.sleep(0.5)
+            
+            vg_actual = gate.measure_voltage(1)
+            self.telemetry_update.emit(vg_actual, 0.0, 0.0)
+
+            self.log_message.emit("Gate verified. Applying Drain Voltage...")
+            drain.configure_channel(1, self.params['vd'], self.params['vd_comp'])
+            drain.output_on(1)
+            time.sleep(0.5)
+
+            if self.params['target_mode']:
+                self.log_message.emit("Configuring Scope Trigger for Telemetry...")
+                scope.configure_trigger(self.params['trig_chan'], self.params['trig_level'])
+                
+                self.log_message.emit("Initiating Closed-Loop Target Bias Sweep...")
+                target_id = self.params['target_idd']
+                tol = self.params['id_tol']
+                step = abs(self.params['vg_step'])
+                stop_vg = self.params['vg_stop']
+                
+                # Determine direction: 1 if sweeping up (e.g. -5V to 0V), -1 if down
+                direction = 1 if stop_vg > current_vg else -1
+                achieved = False
+
+                for _ in range(100): # Hard cap to prevent infinite loop
+                    vd_actual = drain.measure_voltage(1)
+                    
+                    # Read from scope and convert to Amps using configurable scale
+                    sensor_volts = scope.measure_pulse_top(self.params['scope_chan'])
+                    id_actual = sensor_volts * self.params['scope_scale']
+                    
+                    self.telemetry_update.emit(current_vg, vd_actual, id_actual)
+
+                    # Check if within tolerance
+                    if abs(id_actual - target_id) <= tol:
+                        self.log_message.emit(f"Target IDD achieved: {id_actual:.3f}A at Vg={current_vg:.2f}V")
+                        achieved = True
+                        break
+                    
+                    # Check if we hit the stop limit
+                    if (direction == 1 and current_vg >= stop_vg) or (direction == -1 and current_vg <= stop_vg):
+                        self.log_message.emit("Reached Vg Stop limit without achieving target IDD.")
+                        break
+
+                    # Adjust Gate Voltage
+                    if id_actual < target_id:
+                        current_vg += direction * step
+                    else:
+                        current_vg -= direction * step
+
+                    # Enforce the stop bound before sending
+                    if (direction == 1 and current_vg > stop_vg): current_vg = stop_vg
+                    if (direction == -1 and current_vg < stop_vg): current_vg = stop_vg
+
+                    gate.configure_channel(1, current_vg, self.params['vg_comp'])
+                    time.sleep(0.3) # Settle time for PSU + Scope capture
+
+                if not achieved:
+                    self.log_message.emit(f"Targeting finished at {current_vg:.2f}V (Not within tolerance).")
+                
+                # Brief hold so operator can observe telemetry
+                time.sleep(2.0)
+            else:
+                self.log_message.emit("Standard bias applied. Monitoring telemetry...")
+                for _ in range(5):
+                    vd_actual = drain.measure_voltage(1)
+                    id_actual = drain.measure_current(1)
+                    self.telemetry_update.emit(current_vg, vd_actual, id_actual)
+                    time.sleep(1)
+
+            self.log_message.emit("Bias sequence complete. Initiating Safe Shutdown...")
+            drain.output_off(1)
+            time.sleep(0.5)
+            gate.output_off(1)
+
+            gate.disconnect()
+            drain.disconnect()
+            if scope: scope.disconnect()
+            self.sequence_complete.emit()
+
+        except Exception as e:
+            try:
+                drain.emergency_shutdown()
+                gate.output_off(1)
+            except:
+                pass
+            self.error_occurred.emit(f"BIAS FAULT: {str(e)}")
+
+
+class PulsedCompressionWorker(QThread):
+    log_message = pyqtSignal(str)
+    data_ready = pyqtSignal(list, list, list) # Pin, Pout, PAE
+    sequence_complete = pyqtSignal()
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, addresses, pulse_params, bias_params, sweep_params):
+        super().__init__()
+        self.addr = addresses
+        self.pulse = pulse_params
+        self.bias = bias_params
+        self.sweep = sweep_params
+
+    def run(self):
+        try:
+            rm = pyvisa.ResourceManager()
+            is_pulsed = (self.pulse['mode'] == "Pulsed RF")
+            
+            # 1. CONNECT HARDWARE DYNAMICALLY
+            vna = VectorNetworkAnalyzer(self.addr['vna'])
+            if not vna.connect(rm): raise Exception("VNA connection failed.")
+            
+            gate, drain, wg, scope = None, None, None, None
+            
+            if self.bias['enable']:
+                gate = PowerSupply(self.addr['gate'])
+                drain = PowerSupply(self.addr['drain'])
+                if not all([gate.connect(rm), drain.connect(rm)]): raise Exception("PSU connection failed.")
+                
+            if is_pulsed:
+                wg = WaveformGenerator(self.addr['wg'])
+                scope = Oscilloscope(self.addr['scope'])
+                if not all([wg.connect(rm), scope.connect(rm)]): raise Exception("Timing Hardware connection failed.")
+
+            if self.bias['enable']:
+                self.log_message.emit("Biasing Device...")
+                gate.configure_channel(1, self.bias['vg'], self.bias['vg_comp'])
+                gate.output_on(1)
+                time.sleep(0.5)
+                drain.configure_channel(1, self.bias['vd'], self.bias['vd_comp'])
+                drain.output_on(1)
+                time.sleep(1)
+
+            # 3. SETUP TIMING & MEASUREMENT MODE
+            vna.setup_unratioed_power_measure()
+            vna.write("SENS1:SWE:POIN 1") 
+
+            if is_pulsed:
+                self.log_message.emit("Configuring Pulsed Mode...")
+                wg.configure_pulse_trigger(self.pulse['width'], self.pulse['period'], self.pulse['delay'])
+                scope.configure_trigger(self.pulse['trig_chan'], self.pulse['trig_level'])
+                scope.set_timebase(self.pulse['period'])
+                vna.write("TRIG:SOUR EXT") # VNA waits for WG sync
+            else:
+                self.log_message.emit("Configuring CW Mode...")
+                vna.write("TRIG:SOUR IMM") # Free run
+                vna.rf_on()
+
+            # 4. SWEEP LOOP
+            num_f_points = int(abs(self.sweep['f_max'] - self.sweep['f_min']) / self.sweep['f_step']) + 1 if self.sweep['f_step'] != 0 else 1
+            freqs = [self.sweep['f_min'] + (i * self.sweep['f_step']) for i in range(num_f_points)]
+            
+            num_p_points = int(abs(self.sweep['p_max'] - self.sweep['p_min']) / self.sweep['p_step']) + 1 if self.sweep['p_step'] != 0 else 1
+            powers = [self.sweep['p_min'] + (i * self.sweep['p_step']) for i in range(num_p_points)]
+
+            for freq in freqs:
+                self.log_message.emit(f"Sweeping {freq/1e9:.2f} GHz...")
+                vna.set_cw_frequency(f"{freq} Hz")
+                
+                pin_results, pout_results, pae_results = [], [], []
+
+                for pin in powers:
+                    vna.set_power_level(pin)
+                    time.sleep(0.05) 
+                    
+                    id_current = 0.0
+                    
+                    if is_pulsed:
+                        wg.fire_single_pulse()
+                        time.sleep(self.pulse['delay'] + self.pulse['width'] + 0.1) # Wait for pulse to finish
+                        pout = vna.measure_single_point()
+                        
+                        if self.bias['enable']:
+                            sensor_volts = scope.measure_pulse_top(self.pulse['scope_chan'])
+                            id_current = sensor_volts * self.pulse['scope_scale']
+                    else:
+                        pout = vna.measure_single_point()
+                        if self.bias['enable']:
+                            id_current = drain.measure_current(1)
+                    
+                    # PAE Math
+                    if self.bias['enable'] and id_current > 0.001: 
+                        pout_w = 10 ** ((pout - 30) / 10)
+                        pin_w = 10 ** ((pin - 30) / 10)
+                        pdc_w = self.bias['vd'] * id_current
+                        pae = ((pout_w - pin_w) / pdc_w) * 100.0
+                    else:
+                        pae = 0.0
+                    
+                    pin_results.append(pin)
+                    pout_results.append(pout)
+                    pae_results.append(pae)
+                
+                self.data_ready.emit(pin_results, pout_results, pae_results)
+
+            # 5. SHUTDOWN
+            vna.rf_off()
+            if self.bias['enable']:
+                self.log_message.emit("Sweep complete. Safe DC Shutdown...")
+                drain.output_off(1)
+                time.sleep(0.5)
+                gate.output_off(1)
+            
+            self.sequence_complete.emit()
+
+        except Exception as e:
+            if self.bias['enable']:
+                try:
+                    drain.emergency_shutdown()
+                    gate.output_off(1)
+                except:
+                    pass
+            self.error_occurred.emit(f"COMPRESSION FAULT: {str(e)}")
+
+
+class HarmonicsWorker(QThread):
+    log_message = pyqtSignal(str)
+    data_ready = pyqtSignal(list, list) # Labels, Values (dBc)
+    sequence_complete = pyqtSignal()
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, addresses, f0_hz, pin_dbm, bias_params, active_harmonics):
+        super().__init__()
+        self.addr = addresses
+        self.f0_hz = f0_hz
+        self.pin_dbm = pin_dbm
+        self.bias = bias_params
+        self.active_harmonics = active_harmonics
+
+    def run(self):
+        try:
+            rm = pyvisa.ResourceManager()
+            vna = VectorNetworkAnalyzer(self.addr['vna'])
+            sa = SignalAnalyzer(self.addr['sa'])
+            
+            instruments = [vna.connect(rm), sa.connect(rm)]
+            if self.bias['enable']:
+                gate = PowerSupply(self.addr['gate'])
+                drain = PowerSupply(self.addr['drain'])
+                instruments.extend([gate.connect(rm), drain.connect(rm)])
+                
+            if not all(instruments): raise Exception("Hardware connection failure.")
+
+            if self.bias['enable']:
+                self.log_message.emit("Biasing Device...")
+                gate.configure_channel(1, self.bias['vg'], self.bias['vg_comp'])
+                gate.output_on(1)
+                time.sleep(0.5)
+                drain.configure_channel(1, self.bias['vd'], self.bias['vd_comp'])
+                drain.output_on(1)
+                time.sleep(1)
+
+            vna.set_cw_frequency(self.f0_hz)
+            vna.set_power_level(self.pin_dbm)
+            vna.rf_on()
+            time.sleep(0.5) 
+            
+            self.log_message.emit("Measuring Fundamental (f0)...")
+            fund_dbm = sa.measure_peak_power(self.f0_hz)
+            
+            labels = ["Fundamental"]
+            powers_dbc = [0.0] 
+
+            for label, multiplier in self.active_harmonics.items():
+                target_freq = self.f0_hz * multiplier
+                self.log_message.emit(f"Hunting for {label} at {target_freq/1e9:.3f} GHz...")
+                harm_dbm = sa.measure_peak_power(target_freq)
+                dbc_value = harm_dbm - fund_dbm
+                labels.append(label)
+                powers_dbc.append(dbc_value)
+
+            self.data_ready.emit(labels, powers_dbc)
+
+            vna.rf_off()
+            if self.bias['enable']:
+                self.log_message.emit("Safe DC Shutdown...")
+                drain.output_off(1)
+                time.sleep(0.5)
+                gate.output_off(1)
+            
+            self.sequence_complete.emit()
+
+        except Exception as e:
+            if self.bias['enable']:
+                try:
+                    drain.emergency_shutdown()
+                    gate.output_off(1)
+                except: pass
+            self.error_occurred.emit(f"HARMONICS FAULT: {str(e)}")
+
+
+# =============================================================================
+# MAIN GRAPHICAL INTERFACE (The View Layer)
+# =============================================================================
+
+class TestExecutiveGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("GaN RF Test Executive Framework")
+        self.resize(1200, 950)
+        
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        
+        # --- GLOBAL KILL SWITCH ---
+        self.btn_kill = QPushButton("GLOBAL EMERGENCY SHUTDOWN")
+        self.btn_kill.setMinimumHeight(50)
+        self.btn_kill.setStyleSheet("background-color: #B22222; color: white; font-weight: bold; font-size: 16px;")
+        self.btn_kill.clicked.connect(self.global_emergency_kill)
+        main_layout.addWidget(self.btn_kill)
+
+        # --- HARDWARE SELECTORS ---
+        hw_group = QGroupBox("Hardware Bus Routing")
+        hw_layout = QHBoxLayout()
+        self.vna_combo = QComboBox(); self.vna_combo.setEditable(True); self.vna_combo.addItem("GPIB0::17::INSTR")
+        self.sa_combo = QComboBox(); self.sa_combo.setEditable(True); self.sa_combo.addItem("GPIB0::18::INSTR")
+        self.gate_combo = QComboBox(); self.gate_combo.setEditable(True); self.gate_combo.addItem("GPIB0::10::INSTR")
+        self.drain_combo = QComboBox(); self.drain_combo.setEditable(True); self.drain_combo.addItem("GPIB0::11::INSTR")
+        self.wg_combo = QComboBox(); self.wg_combo.setEditable(True); self.wg_combo.addItem("GPIB0::20::INSTR")
+        self.scope_combo = QComboBox(); self.scope_combo.setEditable(True); self.scope_combo.addItem("GPIB0::7::INSTR")
+        
+        hw_layout.addWidget(QLabel("VNA:")); hw_layout.addWidget(self.vna_combo)
+        hw_layout.addWidget(QLabel("Gate:")); hw_layout.addWidget(self.gate_combo)
+        hw_layout.addWidget(QLabel("Drain:")); hw_layout.addWidget(self.drain_combo)
+        hw_layout.addWidget(QLabel("SA:")); hw_layout.addWidget(self.sa_combo)
+        hw_layout.addWidget(QLabel("Clock:")); hw_layout.addWidget(self.wg_combo)
+        hw_layout.addWidget(QLabel("Scope:")); hw_layout.addWidget(self.scope_combo)
+        
+        btn_scan = QPushButton("Scan")
+        btn_scan.clicked.connect(self.scan_hardware)
+        hw_layout.addWidget(btn_scan)
+        hw_group.setLayout(hw_layout)
+        main_layout.addWidget(hw_group)
+
+        # --- THE TAB MANAGER ---
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+        
+        self.tab_vna = QWidget(); self.build_vna_tab(); self.tabs.addTab(self.tab_vna, "S-Parameters (Linear)")
+        self.tab_bias = QWidget(); self.build_bias_tab(); self.tabs.addTab(self.tab_bias, "DC Bias Control")
+        self.tab_comp = QWidget(); self.build_compression_tab(); self.tabs.addTab(self.tab_comp, "Compression Sweep")
+        self.tab_harm = QWidget(); self.build_harmonics_tab(); self.tabs.addTab(self.tab_harm, "Spectral Harmonics")
+        
+        # --- GLOBAL STATUS BAR ---
+        self.status_label = QLabel("System Ready.")
+        self.status_label.setStyleSheet("font-weight: bold; color: #00AA00;")
+        main_layout.addWidget(self.status_label)
+
+    # =========================================================================
+    # TAB CONSTRUCTION
+    # =========================================================================
+
+    def build_vna_tab(self):
+        layout = QVBoxLayout(self.tab_vna)
+        self.btn_sweep = QPushButton("Trigger S-Parameter Sweep")
+        self.btn_sweep.clicked.connect(self.trigger_vna_sweep)
+        layout.addWidget(self.btn_sweep)
+        self.plot_widget = pg.PlotWidget(title="Live S-Parameter Matrix")
+        self.plot_widget.addLegend(offset=(10, 10))
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        layout.addWidget(self.plot_widget)
+
+    def build_bias_tab(self):
+        layout = QVBoxLayout(self.tab_bias)
+        
+        # 1. Power Supply Base Targets & Compliance
+        psu_group = QGroupBox("Base Targets & PSU Compliance")
+        psu_layout = QFormLayout()
+        
+        self.input_vd = QLineEdit("28.0")
+        self.input_vd_comp = QLineEdit("1.5")
+        self.input_vg_comp = QLineEdit("0.05")
+        
+        psu_layout.addRow("Vd Target Voltage (V):", self.input_vd)
+        psu_layout.addRow("Vd Overcurrent Compliance (A):", self.input_vd_comp)
+        psu_layout.addRow("Vg Overcurrent Compliance (A):", self.input_vg_comp)
+        psu_group.setLayout(psu_layout)
+        layout.addWidget(psu_group)
+
+        # 2. Oscilloscope Target Biasing
+        target_group = QGroupBox("Active Target Biasing (Closed-Loop via Oscilloscope)")
+        target_layout = QFormLayout()
+        
+        self.check_target_bias = QCheckBox("Enable Oscilloscope Target IDD Feedback")
+        self.check_target_bias.setChecked(True)
+        target_layout.addRow(self.check_target_bias)
+
+        self.input_vg_start = QLineEdit("-5.0")
+        self.input_vg_stop = QLineEdit("-1.0")
+        self.input_vg_step = QLineEdit("0.05")
+        self.input_target_idd = QLineEdit("0.5")
+        self.input_id_tol = QLineEdit("0.05")
+        self.input_scope_scale = QLineEdit("10.0")
+        
+        # Added Scope Trigger Configuration Inputs
+        self.input_bias_trig_chan = QLineEdit("4")
+        self.input_bias_trig_level = QLineEdit("0.5")
+        self.input_bias_scope_chan = QLineEdit("1")
+
+        target_layout.addRow("Vg Sweep Start / Pinch-Off (V):", self.input_vg_start)
+        target_layout.addRow("Vg Sweep Stop Limit (V):", self.input_vg_stop)
+        target_layout.addRow("Vg Step Size (V):", self.input_vg_step)
+        target_layout.addRow("Target IDD (A):", self.input_target_idd)
+        target_layout.addRow("Id Tolerance (A):", self.input_id_tol)
+        target_layout.addRow("Scope Trigger Channel:", self.input_bias_trig_chan)
+        target_layout.addRow("Scope Trigger Level (V):", self.input_bias_trig_level)
+        target_layout.addRow("Scope Measurement Channel:", self.input_bias_scope_chan)
+        target_layout.addRow("Scope Voltage-to-Amps Scale (A/V):", self.input_scope_scale)
+        
+        target_group.setLayout(target_layout)
+        layout.addWidget(target_group)
+
+        # 3. Execution
+        self.btn_bias = QPushButton("Execute Sequenced GaN Bias")
+        self.btn_bias.setMinimumHeight(40)
+        self.btn_bias.clicked.connect(self.trigger_bias_sequence)
+        layout.addWidget(self.btn_bias)
+        
+        self.telemetry_label = QLabel("Telemetry State: Vg=0.00V | Vd=0.00V | Id=0.000A")
+        self.telemetry_label.setStyleSheet("font-size: 14px; font-family: monospace; padding: 10px; background-color: #1E1E1E; color: #00FF00;")
+        layout.addWidget(self.telemetry_label)
+        layout.addStretch()
+
+    def build_compression_tab(self):
+        layout = QVBoxLayout(self.tab_comp)
+        
+        # Mode & Bias Control
+        control_layout = QHBoxLayout()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Continuous Wave (CW)", "Pulsed RF"])
+        self.check_comp_bias = QCheckBox("Enable DC Bias Sequence")
+        self.check_comp_bias.setChecked(True)
+        control_layout.addWidget(QLabel("Test Mode:"))
+        control_layout.addWidget(self.mode_combo)
+        control_layout.addWidget(self.check_comp_bias)
+        layout.addLayout(control_layout)
+
+        # Pulse Timing & Triggering Inputs
+        time_group = QGroupBox("Pulse Timing & Scope Configuration (Ignored in CW Mode)")
+        time_layout = QFormLayout()
+        
+        self.input_width = QLineEdit("1e-6")
+        self.input_period = QLineEdit("1e-3")
+        self.input_delay = QLineEdit("0")
+        
+        # Scope and Trigger controls for Compression Tab
+        self.input_trig_chan = QLineEdit("4")
+        self.input_trig_level = QLineEdit("0.5")
+        self.input_scope_chan = QLineEdit("1")
+        
+        time_layout.addRow("Pulse Width (s):", self.input_width)
+        time_layout.addRow("Period (s):", self.input_period)
+        time_layout.addRow("Measurement Delay (s):", self.input_delay)
+        time_layout.addRow("Scope Trigger Channel:", self.input_trig_chan)
+        time_layout.addRow("Scope Trigger Level (V):", self.input_trig_level)
+        time_layout.addRow("Scope Measurement Channel:", self.input_scope_chan)
+        
+        time_group.setLayout(time_layout)
+        layout.addWidget(time_group)
+
+        # Sweep Parameters
+        sweep_group = QGroupBox("RF Sweep Parameters")
+        sweep_layout = QFormLayout()
+        
+        row1 = QHBoxLayout(); row1.addWidget(QLabel("F_Min (Hz):")); self.input_fmin = QLineEdit("1e9"); row1.addWidget(self.input_fmin)
+        row1.addWidget(QLabel("F_Max (Hz):")); self.input_fmax = QLineEdit("10e9"); row1.addWidget(self.input_fmax)
+        row1.addWidget(QLabel("F_Step (Hz):")); self.input_fstep = QLineEdit("1e9"); row1.addWidget(self.input_fstep)
+        
+        row2 = QHBoxLayout(); row2.addWidget(QLabel("P_Min (dBm):")); self.input_pmin = QLineEdit("-20"); row2.addWidget(self.input_pmin)
+        row2.addWidget(QLabel("P_Max (dBm):")); self.input_pmax = QLineEdit("5.0"); row2.addWidget(self.input_pmax)
+        row2.addWidget(QLabel("P_Step (dBm):")); self.input_pstep = QLineEdit("1.0"); row2.addWidget(self.input_pstep)
+        
+        sweep_layout.addRow(row1); sweep_layout.addRow(row2)
+        sweep_group.setLayout(sweep_layout)
+        layout.addWidget(sweep_group)
+        
+        self.btn_comp = QPushButton("Start Compression Sweep")
+        self.btn_comp.setMinimumHeight(40)
+        self.btn_comp.clicked.connect(self.trigger_compression_sweep)
+        layout.addWidget(self.btn_comp)
+        
+        self.comp_plot = pg.PlotWidget(title="AM/AM Compression & Efficiency")
+        self.comp_plot.addLegend(offset=(10, 10))
+        self.comp_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.comp_plot.setLabel('left', 'Pout', units='dBm')
+        self.comp_plot.setLabel('bottom', 'Pin', units='dBm')
+        layout.addWidget(self.comp_plot)
+
+    def build_harmonics_tab(self):
+        layout = QVBoxLayout(self.tab_harm)
+        self.check_harm_bias = QCheckBox("Enable DC Bias Sequence")
+        self.check_harm_bias.setChecked(True)
+        layout.addWidget(self.check_harm_bias)
+
+        form_layout = QFormLayout()
+        self.input_harm_f0 = QLineEdit("2e9") 
+        self.input_harm_pin = QLineEdit("-10.0")
+        form_layout.addRow("Fundamental CW Freq (Hz):", self.input_harm_f0)
+        form_layout.addRow("Drive Power (dBm):", self.input_harm_pin)
+        layout.addLayout(form_layout)
+
+        self.harm_checks = {}
+        harm_layout = QHBoxLayout()
+        harm_layout.addWidget(QLabel("Select Target Tones:"))
+        tones = {"f/3": 1/3, "f/2": 0.5, "2f": 2.0, "3f": 3.0, "4f": 4.0, "5f": 5.0}
+        
+        for name, mult in tones.items():
+            chk = QCheckBox(name)
+            if mult >= 2.0 and mult <= 3.0: chk.setChecked(True) 
+            self.harm_checks[name] = (chk, mult)
+            harm_layout.addWidget(chk)
+            
+        layout.addLayout(harm_layout)
+        self.btn_harm = QPushButton("Run Spectral Scan")
+        self.btn_harm.clicked.connect(self.trigger_harmonics)
+        layout.addWidget(self.btn_harm)
+        
+        self.harm_plot = pg.PlotWidget(title="Relative Harmonic Levels (dBc)")
+        self.harm_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.harm_plot.setLabel('left', 'Power Relative to f0', units='dBc')
+        layout.addWidget(self.harm_plot)
+
+    # =========================================================================
+    # EXECUTION LOGIC
+    # =========================================================================
+
+    def scan_hardware(self):
+        try:
+            rm = pyvisa.ResourceManager()
+            resources = rm.list_resources()
+            if resources:
+                for combo in [self.vna_combo, self.sa_combo, self.gate_combo, self.drain_combo, self.wg_combo, self.scope_combo]:
+                    combo.clear()
+                    combo.addItems(resources)
+                self.status_label.setText("Scan Complete.")
+        except Exception as e:
+            self.status_label.setText(f"Scan failed: {e}")
+
+    def trigger_vna_sweep(self):
+        self.btn_sweep.setEnabled(False)
+        self.vna_thread = VNASweepWorker(self.vna_combo.currentText())
+        self.vna_thread.data_ready.connect(self.update_vna_plots)
+        self.vna_thread.error_occurred.connect(self.handle_error)
+        self.vna_thread.start()
+
+    def update_vna_plots(self, data):
+        self.plot_widget.clear()
+        if "S21" in data: self.plot_widget.plot(data["S21"], pen='g', name="S21")
+        if "S11" in data: self.plot_widget.plot(data["S11"], pen='y', name="S11")
+        self.btn_sweep.setEnabled(True)
+
+    def trigger_bias_sequence(self):
+        self.btn_bias.setEnabled(False)
+        
+        addresses = {
+            'gate': self.gate_combo.currentText(),
+            'drain': self.drain_combo.currentText(),
+            'scope': self.scope_combo.currentText()
+        }
+        
+        bias_params = {
+            'vd': float(self.input_vd.text()),
+            'vd_comp': float(self.input_vd_comp.text()),
+            'vg_comp': float(self.input_vg_comp.text()),
+            'vg_start': float(self.input_vg_start.text()),
+            'vg_stop': float(self.input_vg_stop.text()),
+            'vg_step': float(self.input_vg_step.text()),
+            'target_idd': float(self.input_target_idd.text()),
+            'id_tol': float(self.input_id_tol.text()),
+            'target_mode': self.check_target_bias.isChecked(),
+            'scope_chan': self.input_bias_scope_chan.text(),
+            'trig_chan': self.input_bias_trig_chan.text(),
+            'trig_level': float(self.input_bias_trig_level.text()),
+            'scope_scale': float(self.input_scope_scale.text())
+        }
+        
+        self.bias_thread = GaNBiasWorker(addresses, bias_params)
+        self.bias_thread.log_message.connect(self.status_label.setText)
+        self.bias_thread.telemetry_update.connect(
+            lambda vg, vd, id: self.telemetry_label.setText(f"Telemetry: Vg={vg:.2f}V | Vd={vd:.2f}V | Id={id:.3f}A")
+        )
+        self.bias_thread.sequence_complete.connect(lambda: self.btn_bias.setEnabled(True))
+        self.bias_thread.error_occurred.connect(self.handle_error)
+        self.bias_thread.start()
+
+    def trigger_compression_sweep(self):
+        self.btn_comp.setEnabled(False)
+        self.comp_plot.clear()
+        
+        addresses = {
+            'vna': self.vna_combo.currentText(),
+            'gate': self.gate_combo.currentText(),
+            'drain': self.drain_combo.currentText(),
+            'wg': self.wg_combo.currentText(),
+            'scope': self.scope_combo.currentText()
+        }
+        
+        pulse_params = {
+            'mode': self.mode_combo.currentText(),
+            'width': float(self.input_width.text()),
+            'period': float(self.input_period.text()),
+            'delay': float(self.input_delay.text()),
+            'trig_chan': self.input_trig_chan.text(),
+            'trig_level': float(self.input_trig_level.text()),
+            'scope_chan': self.input_scope_chan.text(),
+            'scope_scale': float(self.input_scope_scale.text())
+        }
+        
+        bias_params = {
+            'enable': self.check_comp_bias.isChecked(),
+            'vg': float(self.input_vg_start.text()), # Reference the global pinch-off start Vg
+            'vg_comp': float(self.input_vg_comp.text()),
+            'vd': float(self.input_vd.text()),
+            'vd_comp': float(self.input_vd_comp.text())
+        }
+        
+        sweep_params = {
+            'f_min': float(self.input_fmin.text()), 'f_max': float(self.input_fmax.text()), 'f_step': float(self.input_fstep.text()),
+            'p_min': float(self.input_pmin.text()), 'p_max': float(self.input_pmax.text()), 'p_step': float(self.input_pstep.text())
+        }
+        
+        self.comp_thread = PulsedCompressionWorker(addresses, pulse_params, bias_params, sweep_params)
+        self.comp_thread.log_message.connect(self.status_label.setText)
+        self.comp_thread.data_ready.connect(self.update_comp_plot)
+        self.comp_thread.sequence_complete.connect(lambda: self.btn_comp.setEnabled(True))
+        self.comp_thread.error_occurred.connect(self.handle_error)
+        self.comp_thread.start()
+
+    def update_comp_plot(self, pin, pout, pae):
+        self.comp_plot.clear() 
+        self.comp_plot.plot(pin, pout, pen=pg.mkPen('b', width=2), symbol='o', name="Pout (dBm)")
+        self.comp_plot.plot(pin, pae, pen=pg.mkPen('m', width=2), symbol='x', name="PAE (%)")
+
+    def trigger_harmonics(self):
+        self.btn_harm.setEnabled(False)
+        self.harm_plot.clear()
+        
+        active_targets = {name: mult for name, (chk, mult) in self.harm_checks.items() if chk.isChecked()}
+        if not active_targets:
+            self.status_label.setText("Please select at least one harmonic to measure.")
+            self.btn_harm.setEnabled(True)
+            return
+
+        addresses = {
+            'vna': self.vna_combo.currentText(), 'sa': self.sa_combo.currentText(),
+            'gate': self.gate_combo.currentText(), 'drain': self.drain_combo.currentText()
+        }
+        
+        bias_params = {
+            'enable': self.check_harm_bias.isChecked(),
+            'vg': float(self.input_vg_start.text()), # Reference the global pinch-off start Vg
+            'vg_comp': float(self.input_vg_comp.text()),
+            'vd': float(self.input_vd.text()),
+            'vd_comp': float(self.input_vd_comp.text())
+        }
+
+        self.harm_thread = HarmonicsWorker(
+            addresses, float(self.input_harm_f0.text()), float(self.input_harm_pin.text()),
+            bias_params, active_targets
+        )
+        self.harm_thread.log_message.connect(self.status_label.setText)
+        self.harm_thread.data_ready.connect(self.update_harmonics_plot)
+        self.harm_thread.sequence_complete.connect(lambda: self.btn_harm.setEnabled(True))
+        self.harm_thread.error_occurred.connect(self.handle_error)
+        self.harm_thread.start()
+
+    def update_harmonics_plot(self, labels, powers_dbc):
+        self.harm_plot.clear()
+        x = list(range(len(labels)))
+        bg = pg.BarGraphItem(x=x, height=powers_dbc, width=0.6, brush='c')
+        self.harm_plot.addItem(bg)
+        ax = self.harm_plot.getAxis('bottom')
+        ticks = [list(zip(x, labels))]
+        ax.setTicks(ticks)
+
+    def handle_error(self, msg):
+        self.status_label.setText(f"ERROR: {msg}")
+        self.status_label.setStyleSheet("font-weight: bold; color: #AA0000;")
+        self.btn_sweep.setEnabled(True)
+        self.btn_bias.setEnabled(True)
+        self.btn_comp.setEnabled(True)
+        self.btn_harm.setEnabled(True)
+
+    def global_emergency_kill(self):
+        self.status_label.setText("EMERGENCY SHUTDOWN EXECUTED.")
+        self.status_label.setStyleSheet("font-weight: bold; color: #AA0000;")
+        try:
+            rm = pyvisa.ResourceManager()
+            VectorNetworkAnalyzer(self.vna_combo.currentText()).connect(rm) and VectorNetworkAnalyzer(self.vna_combo.currentText()).rf_off()
+            PowerSupply(self.drain_combo.currentText()).connect(rm) and PowerSupply(self.drain_combo.currentText()).emergency_shutdown()
+            PowerSupply(self.gate_combo.currentText()).connect(rm) and PowerSupply(self.gate_combo.currentText()).output_off(1)
+        except: pass
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    main_window = TestExecutiveGUI()
+    main_window.show()
+    sys.exit(app.exec())
