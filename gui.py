@@ -99,47 +99,39 @@ class GaNBiasWorker(QThread):
                 step = abs(self.params['vg_step'])
                 stop_vg = self.params['vg_stop']
                 
-                # Determine direction: 1 if sweeping up (e.g. -5V to 0V), -1 if down
                 direction = 1 if stop_vg > current_vg else -1
                 achieved = False
 
-                for _ in range(100): # Hard cap to prevent infinite loop
+                for _ in range(100): 
                     vd_actual = drain.measure_voltage(1)
-                    
-                    # Read from scope and convert to Amps using configurable scale
                     sensor_volts = scope.measure_pulse_top(self.params['scope_chan'])
                     id_actual = sensor_volts * self.params['scope_scale']
                     
                     self.telemetry_update.emit(current_vg, vd_actual, id_actual)
 
-                    # Check if within tolerance
                     if abs(id_actual - target_id) <= tol:
                         self.log_message.emit(f"Target IDD achieved: {id_actual:.3f}A at Vg={current_vg:.2f}V")
                         achieved = True
                         break
                     
-                    # Check if we hit the stop limit
                     if (direction == 1 and current_vg >= stop_vg) or (direction == -1 and current_vg <= stop_vg):
                         self.log_message.emit("Reached Vg Stop limit without achieving target IDD.")
                         break
 
-                    # Adjust Gate Voltage
                     if id_actual < target_id:
                         current_vg += direction * step
                     else:
                         current_vg -= direction * step
 
-                    # Enforce the stop bound before sending
                     if (direction == 1 and current_vg > stop_vg): current_vg = stop_vg
                     if (direction == -1 and current_vg < stop_vg): current_vg = stop_vg
 
                     gate.configure_channel(1, current_vg, self.params['vg_comp'])
-                    time.sleep(0.3) # Settle time for PSU + Scope capture
+                    time.sleep(0.3)
 
                 if not achieved:
                     self.log_message.emit(f"Targeting finished at {current_vg:.2f}V (Not within tolerance).")
                 
-                # Brief hold so operator can observe telemetry
                 time.sleep(2.0)
             else:
                 self.log_message.emit("Standard bias applied. Monitoring telemetry...")
@@ -186,7 +178,6 @@ class PulsedCompressionWorker(QThread):
             rm = pyvisa.ResourceManager()
             is_pulsed = (self.pulse['mode'] == "Pulsed RF")
             
-            # 1. CONNECT HARDWARE DYNAMICALLY
             vna = VectorNetworkAnalyzer(self.addr['vna'])
             if not vna.connect(rm): raise Exception("VNA connection failed.")
             
@@ -217,13 +208,20 @@ class PulsedCompressionWorker(QThread):
 
             if is_pulsed:
                 self.log_message.emit("Configuring Pulsed Mode...")
-                wg.configure_pulse_trigger(self.pulse['width'], self.pulse['period'], self.pulse['delay'])
+                # Pass the new vhigh and vlow values directly to the WG configure method
+                wg.configure_pulse_trigger(
+                    self.pulse['width'], 
+                    self.pulse['period'], 
+                    self.pulse['delay'],
+                    self.pulse['vhigh'],
+                    self.pulse['vlow']
+                )
                 scope.configure_trigger(self.pulse['trig_chan'], self.pulse['trig_level'])
                 scope.set_timebase(self.pulse['period'])
-                vna.write("TRIG:SOUR EXT") # VNA waits for WG sync
+                vna.write("TRIG:SOUR EXT") 
             else:
                 self.log_message.emit("Configuring CW Mode...")
-                vna.write("TRIG:SOUR IMM") # Free run
+                vna.write("TRIG:SOUR IMM") 
                 vna.rf_on()
 
             num_f_points = int(abs(self.sweep['f_max'] - self.sweep['f_min']) / self.sweep['f_step']) + 1 if self.sweep['f_step'] != 0 else 1
@@ -246,7 +244,7 @@ class PulsedCompressionWorker(QThread):
                     
                     if is_pulsed:
                         wg.fire_single_pulse()
-                        time.sleep(self.pulse['delay'] + self.pulse['width'] + 0.1) # Wait for pulse to finish
+                        time.sleep(self.pulse['delay'] + self.pulse['width'] + 0.1) 
                         pout = vna.measure_single_point()
                         
                         if self.bias['enable']:
@@ -257,7 +255,6 @@ class PulsedCompressionWorker(QThread):
                         if self.bias['enable']:
                             id_current = drain.measure_current(1)
                     
-                    # PAE Math
                     if self.bias['enable'] and id_current > 0.001: 
                         pout_w = 10 ** ((pout - 30) / 10)
                         pin_w = 10 ** ((pin - 30) / 10)
@@ -272,7 +269,6 @@ class PulsedCompressionWorker(QThread):
                 
                 self.data_ready.emit(freq, pin_results, pout_results, pae_results)
 
-            # 5. SHUTDOWN
             vna.rf_off()
             if self.bias['enable']:
                 self.log_message.emit("Sweep complete. Safe DC Shutdown...")
@@ -294,7 +290,7 @@ class PulsedCompressionWorker(QThread):
 
 class HarmonicsWorker(QThread):
     log_message = pyqtSignal(str)
-    data_ready = pyqtSignal(list, list) # Labels, Values (dBc)
+    data_ready = pyqtSignal(list, list) 
     sequence_complete = pyqtSignal()
     error_occurred = pyqtSignal(str)
 
@@ -378,8 +374,8 @@ class TestExecutiveGUI(QMainWindow):
         self.setWindowTitle("GaN RF Test Executive Framework")
         self.resize(1200, 950)
         
-        # Initialize an empty array to collect all swept compression curves
         self.compression_results = []
+        self.vna_results = None
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -415,7 +411,6 @@ class TestExecutiveGUI(QMainWindow):
         hw_group.setLayout(hw_layout)
         main_layout.addWidget(hw_group)
 
-        # --- STREAMING_CHUNK: Instantiating global DUT tracker layout...
         # --- DUT METADATA GROUP ---
         dut_group = QGroupBox("DUT Metadata Tracker")
         dut_layout = QHBoxLayout()
@@ -452,9 +447,19 @@ class TestExecutiveGUI(QMainWindow):
 
     def build_vna_tab(self):
         layout = QVBoxLayout(self.tab_vna)
+        
+        btn_layout = QHBoxLayout()
         self.btn_sweep = QPushButton("Trigger S-Parameter Sweep")
         self.btn_sweep.clicked.connect(self.trigger_vna_sweep)
-        layout.addWidget(self.btn_sweep)
+        btn_layout.addWidget(self.btn_sweep)
+
+        self.btn_export_vna = QPushButton("Export S-Parameters to CSV")
+        self.btn_export_vna.setEnabled(False)
+        self.btn_export_vna.clicked.connect(self.export_vna_csv)
+        btn_layout.addWidget(self.btn_export_vna)
+
+        layout.addLayout(btn_layout)
+
         self.plot_widget = pg.PlotWidget(title="Live S-Parameter Matrix")
         self.plot_widget.addLegend(offset=(10, 10))
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
@@ -463,7 +468,6 @@ class TestExecutiveGUI(QMainWindow):
     def build_bias_tab(self):
         layout = QVBoxLayout(self.tab_bias)
         
-        # 1. Power Supply Base Targets & Compliance
         psu_group = QGroupBox("Base Targets & PSU Compliance")
         psu_layout = QFormLayout()
         
@@ -477,7 +481,6 @@ class TestExecutiveGUI(QMainWindow):
         psu_group.setLayout(psu_layout)
         layout.addWidget(psu_group)
 
-        # 2. Oscilloscope Target Biasing
         target_group = QGroupBox("Active Target Biasing (Closed-Loop via Oscilloscope)")
         target_layout = QFormLayout()
         
@@ -502,7 +505,6 @@ class TestExecutiveGUI(QMainWindow):
         target_group.setLayout(target_layout)
         layout.addWidget(target_group)
 
-        # 3. Execution
         self.btn_bias = QPushButton("Execute Sequenced GaN Bias")
         self.btn_bias.setMinimumHeight(40)
         self.btn_bias.clicked.connect(self.trigger_bias_sequence)
@@ -527,15 +529,26 @@ class TestExecutiveGUI(QMainWindow):
         control_layout.addWidget(self.check_comp_bias)
         layout.addLayout(control_layout)
 
-        # Pulse Timing Inputs
-        time_group = QGroupBox("Pulsed Timing Parameters (Ignored in CW Mode)")
-        time_layout = QHBoxLayout()
+        # Pulse Timing & Level Inputs (Vhigh / Vlow)
+        time_group = QGroupBox("Pulsed Timing & Level Parameters (Keysight 33500B)")
+        time_layout = QVBoxLayout()
+        
+        row_timing = QHBoxLayout()
         self.input_width = QLineEdit("1e-6")
         self.input_period = QLineEdit("1e-3")
         self.input_delay = QLineEdit("0")
-        time_layout.addWidget(QLabel("Pulse Width (s):")); time_layout.addWidget(self.input_width)
-        time_layout.addWidget(QLabel("Period (s):")); time_layout.addWidget(self.input_period)
-        time_layout.addWidget(QLabel("Measurement Delay (s):")); time_layout.addWidget(self.input_delay)
+        row_timing.addWidget(QLabel("Pulse Width (s):")); row_timing.addWidget(self.input_width)
+        row_timing.addWidget(QLabel("Period (s):")); row_timing.addWidget(self.input_period)
+        row_timing.addWidget(QLabel("Measurement Delay (s):")); row_timing.addWidget(self.input_delay)
+        time_layout.addLayout(row_timing)
+        
+        row_levels = QHBoxLayout()
+        self.input_vhigh = QLineEdit("3.3")
+        self.input_vlow = QLineEdit("0.0")
+        row_levels.addWidget(QLabel("Pulse Vhigh (V):")); row_levels.addWidget(self.input_vhigh)
+        row_levels.addWidget(QLabel("Pulse Vlow (V):")); row_levels.addWidget(self.input_vlow)
+        time_layout.addLayout(row_levels)
+        
         time_group.setLayout(time_layout)
         layout.addWidget(time_group)
 
@@ -629,6 +642,8 @@ class TestExecutiveGUI(QMainWindow):
 
     def trigger_vna_sweep(self):
         self.btn_sweep.setEnabled(False)
+        self.btn_export_vna.setEnabled(False)
+        self.vna_results = None
         self.vna_thread = VNASweepWorker(self.vna_combo.currentText())
         self.vna_thread.data_ready.connect(self.update_vna_plots)
         self.vna_thread.error_occurred.connect(self.handle_error)
@@ -636,11 +651,70 @@ class TestExecutiveGUI(QMainWindow):
 
     def update_vna_plots(self, data):
         self.plot_widget.clear()
+        self.vna_results = data
+        
         if "S11" in data: self.plot_widget.plot(data["S11"], pen='y', name="S11")
         if "S21" in data: self.plot_widget.plot(data["S21"], pen='g', name="S21")
         if "S12" in data: self.plot_widget.plot(data["S12"], pen='c', name="S12")
         if "S22" in data: self.plot_widget.plot(data["S22"], pen='m', name="S22")
+        
         self.btn_sweep.setEnabled(True)
+        self.btn_export_vna.setEnabled(True)
+        self.status_label.setText("S-Parameter Sweep Complete. Data ready to export.")
+
+    def export_vna_csv(self):
+        if not self.vna_results:
+            self.status_label.setText("No S-Parameter data found to export.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export S-Parameter Data", "", "CSV Files (*.csv)")
+        if file_path:
+            try:
+                pn = self.input_pn.text()
+                sn = self.input_sn.text()
+                lot = self.input_lot.text()
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+                file_exists = os.path.exists(file_path) and os.path.getsize(file_path) > 0
+
+                with open(file_path, mode='a', newline='') as f:
+                    writer = csv.writer(f)
+                    
+                    if not file_exists:
+                        writer.writerow([
+                            "Execution Timestamp", "Part Number", "Serial Number", "Lot Number",
+                            "Frequency (Hz)", "S11 (dB)", "S21 (dB)", "S12 (dB)", "S22 (dB)"
+                        ])
+                    
+                    freqs = self.vna_results.get("Frequency", [])
+                    s11 = self.vna_results.get("S11", [])
+                    s21 = self.vna_results.get("S21", [])
+                    s12 = self.vna_results.get("S12", [])
+                    s22 = self.vna_results.get("S22", [])
+                    
+                    num_points = max(len(s11), len(s21), len(s12), len(s22), len(freqs))
+                    if len(freqs) == 0 and num_points > 0:
+                        f_start = 1e9
+                        f_stop = 10e9
+                        freqs = [f_start + i * (f_stop - f_start) / (num_points - 1) for i in range(num_points)] if num_points > 1 else [f_start]
+
+                    row_count = 0
+                    for i in range(num_points):
+                        f_val = freqs[i] if i < len(freqs) else ""
+                        s11_val = s11[i] if i < len(s11) else ""
+                        s21_val = s21[i] if i < len(s21) else ""
+                        s12_val = s12[i] if i < len(s12) else ""
+                        s22_val = s22[i] if i < len(s22) else ""
+                        
+                        writer.writerow([
+                            timestamp, pn, sn, lot,
+                            f_val, s11_val, s21_val, s12_val, s22_val
+                        ])
+                        row_count += 1
+                
+                self.status_label.setText(f"Appended {row_count} S-Parameter rows to {os.path.basename(file_path)} successfully.")
+            except Exception as e:
+                self.handle_error(f"Failed to export S-Parameter CSV: {str(e)}")
 
     def trigger_bias_sequence(self):
         self.btn_bias.setEnabled(False)
@@ -679,7 +753,6 @@ class TestExecutiveGUI(QMainWindow):
         self.btn_export_comp.setEnabled(False)
         self.comp_plot.clear()
         
-        # Reset data arrays to accumulate fresh data for this entire sweep
         self.compression_results = []
         
         addresses = {
@@ -695,6 +768,8 @@ class TestExecutiveGUI(QMainWindow):
             'width': float(self.input_width.text()),
             'period': float(self.input_period.text()),
             'delay': float(self.input_delay.text()),
+            'vhigh': float(self.input_vhigh.text()), # Passed voltage high configuration
+            'vlow': float(self.input_vlow.text()),   # Passed voltage low configuration
             'trig_chan': 1,
             'trig_level': 0.5,
             'scope_chan': 1,
@@ -722,7 +797,6 @@ class TestExecutiveGUI(QMainWindow):
         self.comp_thread.start()
 
     def update_comp_plot(self, freq, pin, pout, pae):
-        # Accumulate the data trace for this specific frequency step
         self.compression_results.append({
             'frequency': freq,
             'pin': pin,
@@ -730,7 +804,6 @@ class TestExecutiveGUI(QMainWindow):
             'pae': pae
         })
         
-        # Plot the latest sweep trace in real-time
         self.comp_plot.clear() 
         self.comp_plot.plot(pin, pout, pen=pg.mkPen('b', width=2), symbol='o', name=f"Pout @ {freq/1e9:.2f} GHz (dBm)")
         self.comp_plot.plot(pin, pae, pen=pg.mkPen('m', width=2), symbol='x', name=f"PAE @ {freq/1e9:.2f} GHz (%)")
@@ -754,21 +827,18 @@ class TestExecutiveGUI(QMainWindow):
                 lot = self.input_lot.text()
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
-                # Check if the file exists and has content to decide if headers are written
                 file_exists = os.path.exists(file_path) and os.path.getsize(file_path) > 0
 
                 with open(file_path, mode='a', newline='') as f:
                     writer = csv.writer(f)
                     
                     if not file_exists:
-                        # Write clean, database-ready flat headers
                         writer.writerow([
                             "Execution Timestamp", "Part Number", "Serial Number", "Lot Number",
                             "Frequency (Hz)", "Input Power (dBm)", "Output Power (dBm)", "Power Added Efficiency (%)"
                         ])
                     
                     row_count = 0
-                    # Traverse all collected sweeps and write row by row
                     for sweep in self.compression_results:
                         f_hz = sweep['frequency']
                         pins = sweep['pin']
