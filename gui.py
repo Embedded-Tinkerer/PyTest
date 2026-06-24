@@ -2,8 +2,10 @@ import sys
 import pyvisa
 import time
 import math
+import csv
+import os
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QCheckBox,
-                             QHBoxLayout, QPushButton, QLabel, QLineEdit, QFormLayout, QTabWidget, QComboBox, QGroupBox)
+                             QHBoxLayout, QPushButton, QLabel, QLineEdit, QFormLayout, QTabWidget, QComboBox, QGroupBox, QFileDialog)
 from PyQt6.QtCore import QThread, pyqtSignal
 import pyqtgraph as pg
 
@@ -91,9 +93,6 @@ class GaNBiasWorker(QThread):
             time.sleep(0.5)
 
             if self.params['target_mode']:
-                self.log_message.emit("Configuring Scope Trigger for Telemetry...")
-                scope.configure_trigger(self.params['trig_chan'], self.params['trig_level'])
-                
                 self.log_message.emit("Initiating Closed-Loop Target Bias Sweep...")
                 target_id = self.params['target_idd']
                 tol = self.params['id_tol']
@@ -171,7 +170,7 @@ class GaNBiasWorker(QThread):
 
 class PulsedCompressionWorker(QThread):
     log_message = pyqtSignal(str)
-    data_ready = pyqtSignal(list, list, list) # Pin, Pout, PAE
+    data_ready = pyqtSignal(float, list, list, list) # Freq, Pin, Pout, PAE
     sequence_complete = pyqtSignal()
     error_occurred = pyqtSignal(str)
 
@@ -227,7 +226,6 @@ class PulsedCompressionWorker(QThread):
                 vna.write("TRIG:SOUR IMM") # Free run
                 vna.rf_on()
 
-            # 4. SWEEP LOOP
             num_f_points = int(abs(self.sweep['f_max'] - self.sweep['f_min']) / self.sweep['f_step']) + 1 if self.sweep['f_step'] != 0 else 1
             freqs = [self.sweep['f_min'] + (i * self.sweep['f_step']) for i in range(num_f_points)]
             
@@ -272,7 +270,7 @@ class PulsedCompressionWorker(QThread):
                     pout_results.append(pout)
                     pae_results.append(pae)
                 
-                self.data_ready.emit(pin_results, pout_results, pae_results)
+                self.data_ready.emit(freq, pin_results, pout_results, pae_results)
 
             # 5. SHUTDOWN
             vna.rf_off()
@@ -380,6 +378,9 @@ class TestExecutiveGUI(QMainWindow):
         self.setWindowTitle("GaN RF Test Executive Framework")
         self.resize(1200, 950)
         
+        # Initialize an empty array to collect all swept compression curves
+        self.compression_results = []
+        
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
@@ -413,6 +414,23 @@ class TestExecutiveGUI(QMainWindow):
         hw_layout.addWidget(btn_scan)
         hw_group.setLayout(hw_layout)
         main_layout.addWidget(hw_group)
+
+        # --- STREAMING_CHUNK: Instantiating global DUT tracker layout...
+        # --- DUT METADATA GROUP ---
+        dut_group = QGroupBox("DUT Metadata Tracker")
+        dut_layout = QHBoxLayout()
+        self.input_pn = QLineEdit("GAN-AMP-10W")
+        self.input_sn = QLineEdit("DUT-001")
+        self.input_lot = QLineEdit("LOT-2026")
+        
+        dut_layout.addWidget(QLabel("Part Number:"))
+        dut_layout.addWidget(self.input_pn)
+        dut_layout.addWidget(QLabel("Serial Number:"))
+        dut_layout.addWidget(self.input_sn)
+        dut_layout.addWidget(QLabel("Lot Number:"))
+        dut_layout.addWidget(self.input_lot)
+        dut_group.setLayout(dut_layout)
+        main_layout.addWidget(dut_group)
 
         # --- THE TAB MANAGER ---
         self.tabs = QTabWidget()
@@ -473,20 +491,12 @@ class TestExecutiveGUI(QMainWindow):
         self.input_target_idd = QLineEdit("0.5")
         self.input_id_tol = QLineEdit("0.05")
         self.input_scope_scale = QLineEdit("10.0")
-        
-        # Added Scope Trigger Configuration Inputs
-        self.input_bias_trig_chan = QLineEdit("4")
-        self.input_bias_trig_level = QLineEdit("0.5")
-        self.input_bias_scope_chan = QLineEdit("1")
 
         target_layout.addRow("Vg Sweep Start / Pinch-Off (V):", self.input_vg_start)
         target_layout.addRow("Vg Sweep Stop Limit (V):", self.input_vg_stop)
         target_layout.addRow("Vg Step Size (V):", self.input_vg_step)
         target_layout.addRow("Target IDD (A):", self.input_target_idd)
         target_layout.addRow("Id Tolerance (A):", self.input_id_tol)
-        target_layout.addRow("Scope Trigger Channel:", self.input_bias_trig_chan)
-        target_layout.addRow("Scope Trigger Level (V):", self.input_bias_trig_level)
-        target_layout.addRow("Scope Measurement Channel:", self.input_bias_scope_chan)
         target_layout.addRow("Scope Voltage-to-Amps Scale (A/V):", self.input_scope_scale)
         
         target_group.setLayout(target_layout)
@@ -517,26 +527,15 @@ class TestExecutiveGUI(QMainWindow):
         control_layout.addWidget(self.check_comp_bias)
         layout.addLayout(control_layout)
 
-        # Pulse Timing & Triggering Inputs
-        time_group = QGroupBox("Pulse Timing & Scope Configuration (Ignored in CW Mode)")
-        time_layout = QFormLayout()
-        
+        # Pulse Timing Inputs
+        time_group = QGroupBox("Pulsed Timing Parameters (Ignored in CW Mode)")
+        time_layout = QHBoxLayout()
         self.input_width = QLineEdit("1e-6")
         self.input_period = QLineEdit("1e-3")
         self.input_delay = QLineEdit("0")
-        
-        # Scope and Trigger controls for Compression Tab
-        self.input_trig_chan = QLineEdit("4")
-        self.input_trig_level = QLineEdit("0.5")
-        self.input_scope_chan = QLineEdit("1")
-        
-        time_layout.addRow("Pulse Width (s):", self.input_width)
-        time_layout.addRow("Period (s):", self.input_period)
-        time_layout.addRow("Measurement Delay (s):", self.input_delay)
-        time_layout.addRow("Scope Trigger Channel:", self.input_trig_chan)
-        time_layout.addRow("Scope Trigger Level (V):", self.input_trig_level)
-        time_layout.addRow("Scope Measurement Channel:", self.input_scope_chan)
-        
+        time_layout.addWidget(QLabel("Pulse Width (s):")); time_layout.addWidget(self.input_width)
+        time_layout.addWidget(QLabel("Period (s):")); time_layout.addWidget(self.input_period)
+        time_layout.addWidget(QLabel("Measurement Delay (s):")); time_layout.addWidget(self.input_delay)
         time_group.setLayout(time_layout)
         layout.addWidget(time_group)
 
@@ -556,10 +555,20 @@ class TestExecutiveGUI(QMainWindow):
         sweep_group.setLayout(sweep_layout)
         layout.addWidget(sweep_group)
         
+        # Dual Button Layout: Run Sweep and Export CSV
+        btn_layout = QHBoxLayout()
         self.btn_comp = QPushButton("Start Compression Sweep")
         self.btn_comp.setMinimumHeight(40)
         self.btn_comp.clicked.connect(self.trigger_compression_sweep)
-        layout.addWidget(self.btn_comp)
+        
+        self.btn_export_comp = QPushButton("Export Sweep to CSV")
+        self.btn_export_comp.setMinimumHeight(40)
+        self.btn_export_comp.setEnabled(False)
+        self.btn_export_comp.clicked.connect(self.export_compression_csv)
+        
+        btn_layout.addWidget(self.btn_comp)
+        btn_layout.addWidget(self.btn_export_comp)
+        layout.addLayout(btn_layout)
         
         self.comp_plot = pg.PlotWidget(title="AM/AM Compression & Efficiency")
         self.comp_plot.addLegend(offset=(10, 10))
@@ -627,8 +636,10 @@ class TestExecutiveGUI(QMainWindow):
 
     def update_vna_plots(self, data):
         self.plot_widget.clear()
-        if "S21" in data: self.plot_widget.plot(data["S21"], pen='g', name="S21")
         if "S11" in data: self.plot_widget.plot(data["S11"], pen='y', name="S11")
+        if "S21" in data: self.plot_widget.plot(data["S21"], pen='g', name="S21")
+        if "S12" in data: self.plot_widget.plot(data["S12"], pen='c', name="S12")
+        if "S22" in data: self.plot_widget.plot(data["S22"], pen='m', name="S22")
         self.btn_sweep.setEnabled(True)
 
     def trigger_bias_sequence(self):
@@ -650,9 +661,7 @@ class TestExecutiveGUI(QMainWindow):
             'target_idd': float(self.input_target_idd.text()),
             'id_tol': float(self.input_id_tol.text()),
             'target_mode': self.check_target_bias.isChecked(),
-            'scope_chan': self.input_bias_scope_chan.text(),
-            'trig_chan': self.input_bias_trig_chan.text(),
-            'trig_level': float(self.input_bias_trig_level.text()),
+            'scope_chan': 1,
             'scope_scale': float(self.input_scope_scale.text())
         }
         
@@ -667,7 +676,11 @@ class TestExecutiveGUI(QMainWindow):
 
     def trigger_compression_sweep(self):
         self.btn_comp.setEnabled(False)
+        self.btn_export_comp.setEnabled(False)
         self.comp_plot.clear()
+        
+        # Reset data arrays to accumulate fresh data for this entire sweep
+        self.compression_results = []
         
         addresses = {
             'vna': self.vna_combo.currentText(),
@@ -682,15 +695,15 @@ class TestExecutiveGUI(QMainWindow):
             'width': float(self.input_width.text()),
             'period': float(self.input_period.text()),
             'delay': float(self.input_delay.text()),
-            'trig_chan': self.input_trig_chan.text(),
-            'trig_level': float(self.input_trig_level.text()),
-            'scope_chan': self.input_scope_chan.text(),
+            'trig_chan': 1,
+            'trig_level': 0.5,
+            'scope_chan': 1,
             'scope_scale': float(self.input_scope_scale.text())
         }
         
         bias_params = {
             'enable': self.check_comp_bias.isChecked(),
-            'vg': float(self.input_vg_start.text()), # Reference the global pinch-off start Vg
+            'vg': float(self.input_vg_start.text()), 
             'vg_comp': float(self.input_vg_comp.text()),
             'vd': float(self.input_vd.text()),
             'vd_comp': float(self.input_vd_comp.text())
@@ -704,14 +717,73 @@ class TestExecutiveGUI(QMainWindow):
         self.comp_thread = PulsedCompressionWorker(addresses, pulse_params, bias_params, sweep_params)
         self.comp_thread.log_message.connect(self.status_label.setText)
         self.comp_thread.data_ready.connect(self.update_comp_plot)
-        self.comp_thread.sequence_complete.connect(lambda: self.btn_comp.setEnabled(True))
+        self.comp_thread.sequence_complete.connect(self.on_compression_complete)
         self.comp_thread.error_occurred.connect(self.handle_error)
         self.comp_thread.start()
 
-    def update_comp_plot(self, pin, pout, pae):
+    def update_comp_plot(self, freq, pin, pout, pae):
+        # Accumulate the data trace for this specific frequency step
+        self.compression_results.append({
+            'frequency': freq,
+            'pin': pin,
+            'pout': pout,
+            'pae': pae
+        })
+        
+        # Plot the latest sweep trace in real-time
         self.comp_plot.clear() 
-        self.comp_plot.plot(pin, pout, pen=pg.mkPen('b', width=2), symbol='o', name="Pout (dBm)")
-        self.comp_plot.plot(pin, pae, pen=pg.mkPen('m', width=2), symbol='x', name="PAE (%)")
+        self.comp_plot.plot(pin, pout, pen=pg.mkPen('b', width=2), symbol='o', name=f"Pout @ {freq/1e9:.2f} GHz (dBm)")
+        self.comp_plot.plot(pin, pae, pen=pg.mkPen('m', width=2), symbol='x', name=f"PAE @ {freq/1e9:.2f} GHz (%)")
+
+    def on_compression_complete(self):
+        self.btn_comp.setEnabled(True)
+        if self.compression_results:
+            self.btn_export_comp.setEnabled(True)
+            self.status_label.setText("Sweep completed. Data ready to export.")
+
+    def export_compression_csv(self):
+        if not self.compression_results:
+            self.status_label.setText("No sweep data found to export.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Compression Sweep Data", "", "CSV Files (*.csv)")
+        if file_path:
+            try:
+                pn = self.input_pn.text()
+                sn = self.input_sn.text()
+                lot = self.input_lot.text()
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+                # Check if the file exists and has content to decide if headers are written
+                file_exists = os.path.exists(file_path) and os.path.getsize(file_path) > 0
+
+                with open(file_path, mode='a', newline='') as f:
+                    writer = csv.writer(f)
+                    
+                    if not file_exists:
+                        # Write clean, database-ready flat headers
+                        writer.writerow([
+                            "Execution Timestamp", "Part Number", "Serial Number", "Lot Number",
+                            "Frequency (Hz)", "Input Power (dBm)", "Output Power (dBm)", "Power Added Efficiency (%)"
+                        ])
+                    
+                    row_count = 0
+                    # Traverse all collected sweeps and write row by row
+                    for sweep in self.compression_results:
+                        f_hz = sweep['frequency']
+                        pins = sweep['pin']
+                        pouts = sweep['pout']
+                        paes = sweep['pae']
+                        for i in range(len(pins)):
+                            writer.writerow([
+                                timestamp, pn, sn, lot,
+                                f_hz, pins[i], pouts[i], paes[i]
+                            ])
+                            row_count += 1
+                
+                self.status_label.setText(f"Appended {row_count} rows to {os.path.basename(file_path)} successfully.")
+            except Exception as e:
+                self.handle_error(f"Failed to export CSV: {str(e)}")
 
     def trigger_harmonics(self):
         self.btn_harm.setEnabled(False)
@@ -730,7 +802,7 @@ class TestExecutiveGUI(QMainWindow):
         
         bias_params = {
             'enable': self.check_harm_bias.isChecked(),
-            'vg': float(self.input_vg_start.text()), # Reference the global pinch-off start Vg
+            'vg': float(self.input_vg_start.text()), 
             'vg_comp': float(self.input_vg_comp.text()),
             'vd': float(self.input_vd.text()),
             'vd_comp': float(self.input_vd_comp.text())
