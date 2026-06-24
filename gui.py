@@ -20,6 +20,91 @@ from oscilloscope import Oscilloscope
 # BACKGROUND WORKER THREADS (The Controller Layer)
 # =============================================================================
 
+class VNACalWorker(QThread):
+    log_message = pyqtSignal(str)
+    sequence_complete = pyqtSignal()
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, pna_address, vna_params):
+        super().__init__()
+        self.pna_address = pna_address
+        self.params = vna_params
+
+    def run(self):
+        try:
+            rm = pyvisa.ResourceManager()
+            vna = VectorNetworkAnalyzer(self.pna_address)
+            if vna.connect(rm):
+                self.log_message.emit("Configuring VNA for ECal Calibration...")
+                vna.reset()
+                
+                # Delete old traces and set up clean, explicit S-parameter traces to prevent mismatch freezes
+                vna.write("CALC1:PAR:DEL:ALL")
+                vna.write("CALC1:PAR:EXT 'Meas_S11', 'S11'")
+                vna.write("CALC1:PAR:EXT 'Meas_S21', 'S21'")
+                vna.write("CALC1:PAR:EXT 'Meas_S12', 'S12'")
+                vna.write("CALC1:PAR:EXT 'Meas_S22', 'S22'")
+                
+                # We must explicitly select a trace to target the active channel context
+                vna.write("CALC1:PAR:SEL 'Meas_S11'")
+                
+                # Display them on Window 1 so the unguided calibration engine can link to them
+                vna.write("DISP:WIND1:STATE ON")
+                vna.write("DISP:WIND1:TRAC1:FEED 'Meas_S11'")
+                vna.write("DISP:WIND1:TRAC2:FEED 'Meas_S21'")
+                vna.write("DISP:WIND1:TRAC3:FEED 'Meas_S12'")
+                vna.write("DISP:WIND1:TRAC4:FEED 'Meas_S22'")
+                
+                # Apply the exact VNA Channel State from the UI
+                vna.write(f"SENS1:FREQ:STAR {self.params['f_start']}")
+                vna.write(f"SENS1:FREQ:STOP {self.params['f_stop']}")
+                vna.write(f"SENS1:SWE:POIN {self.params['points']}")
+                vna.write(f"SENS1:BAND {self.params['ifbw']}")
+                vna.write(f"SOUR1:POW {self.params['power']}")
+                
+                if self.params['avg_enable']:
+                    vna.write("SENS1:AVER ON")
+                    vna.write(f"SENS1:AVER:COUN {self.params['avg_factor']}")
+                else:
+                    vna.write("SENS1:AVER OFF")
+
+                # Extend PyVISA timeout significantly for calibration (120 seconds)
+                # ECal sequences click through multiple internal states and can take a while at low IFBW
+                for attr in ['device', 'instrument', 'resource', 'instr']:
+                    if hasattr(vna, attr):
+                        res = getattr(vna, attr)
+                        if res and hasattr(res, 'timeout'):
+                            res.timeout = 120000 
+                            break
+                
+                # Set unguided calibration parameters for PNA-X
+                vna.write("SENS1:CORR:COLL:METHod SPARSOLT") # Specify 2-port SOLT
+                vna.write("SENS1:CORR:PREFerence:ECAL:ORIentation ON") # Auto detect port mapping
+                
+                self.log_message.emit("Executing 2-Port ECal... Please wait (Do NOT disturb cables).")
+                
+                # Standard Keysight PNA-X command to trigger unguided calibration on ECal module 1, using factory characterization
+                vna.write("SENS1:CORR:COLL ECAL1,CHAR0")
+                
+                # Block the thread until calibration finishes executing
+                opc = vna.query("*OPC?")
+                
+                # Compute error coefficients and apply the calibration
+                self.log_message.emit("Computing and applying calibration coefficients...")
+                vna.write("SENS1:CORR:COLL:SAVE")
+                
+                # Verify that correction is turned ON
+                vna.write("SENS1:CORR:STAT ON")
+                
+                vna.disconnect()
+                self.log_message.emit("ECal Calibration Completed Successfully.")
+                self.sequence_complete.emit()
+            else:
+                self.error_occurred.emit(f"Failed to connect to VNA at {self.pna_address} for calibration.")
+        except Exception as e:
+            self.error_occurred.emit(f"ECAL FAULT: {str(e)}")
+
+
 class VNASweepWorker(QThread):
     data_ready = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
@@ -66,15 +151,19 @@ class VNASweepWorker(QThread):
                 id_meas = drain.measure_current(1)
 
             if vna.connect(rm):
-                # Clean start
-                vna.reset()
+                # Clean trace clear instead of a hard *RST, which clears active ECal calibrations on Channel 1
+                vna.write("CALC1:PAR:DEL:ALL")
                 
-                # Apply custom physical sweep rules to override standard drivers
+                # Apply exact VNA Channel State from the UI
                 vna.write(f"SENS1:FREQ:STAR {self.params['f_start']}")
                 vna.write(f"SENS1:FREQ:STOP {self.params['f_stop']}")
                 vna.write(f"SENS1:SWE:POIN {self.params['points']}")
                 vna.write(f"SENS1:BAND {self.params['ifbw']}")
                 vna.write(f"SOUR1:POW {self.params['power']}")
+                
+                # Force calibration interpolation and correction to remain active on Channel 1
+                vna.write("SENS1:CORR:INT ON")
+                vna.write("SENS1:CORR:STAT ON")
                 
                 # Setup Averaging
                 if self.params['avg_enable']:
@@ -379,9 +468,14 @@ class PulsedCompressionWorker(QThread):
             vna.setup_unratioed_power_measure()
             vna.write("SENS1:SWE:POIN 1") 
 
+            # Force VNA correction and frequency interpolation ON so that the saved ECal calibration 
+            # is successfully applied to the unratioed power measurements on Channel 1
+            vna.write("SENS1:CORR:INT ON")
+            vna.write("SENS1:CORR:STAT ON")
+
             if is_pulsed:
                 self.log_message.emit("Configuring Pulsed Mode...")
-                wg.configure_pulse_trigger(self.pulse['width'], self.pulse['period'], self.pulse['delay'])
+                wg.configure_pulse_trigger(self.pulse['width'], self.pulse['period'], self.pulse['delay'], self.pulse['vhigh'], self.pulse['vlow'])
                 scope.configure_trigger(self.pulse['trig_chan'], self.pulse['trig_level'])
                 scope.set_timebase(self.pulse['period'])
                 vna.write("TRIG:SOUR EXT") 
@@ -677,6 +771,12 @@ class TestExecutiveGUI(QMainWindow):
         
         # Setup control triggers
         btn_layout = QHBoxLayout()
+        
+        self.btn_cal = QPushButton("Run 2-Port ECal Calibration")
+        self.btn_cal.setStyleSheet("background-color: #005A9E; color: white; font-weight: bold;")
+        self.btn_cal.clicked.connect(self.trigger_ecal_calibration)
+        btn_layout.addWidget(self.btn_cal)
+        
         self.btn_sweep = QPushButton("Trigger S-Parameter Sweep")
         self.btn_sweep.clicked.connect(self.trigger_vna_sweep)
         btn_layout.addWidget(self.btn_sweep)
@@ -803,12 +903,23 @@ class TestExecutiveGUI(QMainWindow):
         row2.addWidget(QLabel("P_Max (dBm):")); self.input_pmax = QLineEdit("5.0"); row2.addWidget(self.input_pmax)
         row2.addWidget(QLabel("P_Step (dBm):")); self.input_pstep = QLineEdit("1.0"); row2.addWidget(self.input_pstep)
         
-        sweep_layout.addRow(row1); sweep_layout.addRow(row2)
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("ECal Calibration Power (dBm):"))
+        self.input_comp_cal_power = QLineEdit("-10.0")
+        row3.addWidget(self.input_comp_cal_power)
+        
+        sweep_layout.addRow(row1); sweep_layout.addRow(row2); sweep_layout.addRow(row3)
         sweep_group.setLayout(sweep_layout)
         layout.addWidget(sweep_group)
         
         # Dual Button Layout: Run Sweep and Export CSV
         btn_layout = QHBoxLayout()
+        
+        self.btn_comp_cal = QPushButton("Run Compression ECal")
+        self.btn_comp_cal.setStyleSheet("background-color: #005A9E; color: white; font-weight: bold;")
+        self.btn_comp_cal.setMinimumHeight(40)
+        self.btn_comp_cal.clicked.connect(self.trigger_comp_ecal_calibration)
+        
         self.btn_comp = QPushButton("Start Compression Sweep")
         self.btn_comp.setMinimumHeight(40)
         self.btn_comp.clicked.connect(self.trigger_compression_sweep)
@@ -818,6 +929,7 @@ class TestExecutiveGUI(QMainWindow):
         self.btn_export_comp.setEnabled(False)
         self.btn_export_comp.clicked.connect(self.export_compression_csv)
         
+        btn_layout.addWidget(self.btn_comp_cal)
         btn_layout.addWidget(self.btn_comp)
         btn_layout.addWidget(self.btn_export_comp)
         layout.addLayout(btn_layout)
@@ -879,12 +991,38 @@ class TestExecutiveGUI(QMainWindow):
         except Exception as e:
             self.status_label.setText(f"Scan failed: {e}")
 
+    def trigger_ecal_calibration(self):
+        self.btn_cal.setEnabled(False)
+        self.btn_sweep.setEnabled(False)
+        self.btn_export_vna.setEnabled(False)
+        
+        vna_params = {
+            'f_start': float(self.input_vna_fstart.text()),
+            'f_stop': float(self.input_vna_fstop.text()),
+            'points': int(self.input_vna_points.text()),
+            'power': float(self.input_vna_power.text()),
+            'ifbw': float(self.input_vna_ifbw.text()),
+            'avg_enable': self.check_vna_avg.isChecked(),
+            'avg_factor': int(self.input_vna_avg_factor.text())
+        }
+        
+        self.cal_thread = VNACalWorker(self.vna_combo.currentText(), vna_params)
+        self.cal_thread.log_message.connect(self.status_label.setText)
+        self.cal_thread.error_occurred.connect(self.handle_error)
+        self.cal_thread.sequence_complete.connect(self.on_ecal_complete)
+        self.cal_thread.start()
+
+    def on_ecal_complete(self):
+        self.btn_cal.setEnabled(True)
+        self.btn_sweep.setEnabled(True)
+        self.status_label.setText("ECal Complete. VNA is calibrated and ready to test.")
+
     def trigger_vna_sweep(self):
+        self.btn_cal.setEnabled(False)
         self.btn_sweep.setEnabled(False)
         self.btn_export_vna.setEnabled(False)
         self.vna_results = None
         
-        # Build the structured parameter dictionary for VNA sweep configuration
         vna_params = {
             'f_start': float(self.input_vna_fstart.text()),
             'f_stop': float(self.input_vna_fstop.text()),
@@ -919,19 +1057,17 @@ class TestExecutiveGUI(QMainWindow):
         
         self.vna_results = data
         
-        # Plot magnitudes on standard dB graph
         if "S11" in data: self.plot_widget.plot(data["S11"], pen='y', name="S11")
         if "S21" in data: self.plot_widget.plot(data["S21"], pen='g', name="S21")
         if "S12" in data: self.plot_widget.plot(data["S12"], pen='c', name="S12")
         if "S22" in data: self.plot_widget.plot(data["S22"], pen='m', name="S22")
         
-        # Plot computed Rollett stability K-factor
         if "K_Factor" in data:
             self.k_plot_widget.plot(data["K_Factor"], pen=pg.mkPen('w', width=2), name="K-Factor")
-            # Draw a critical line at K = 1 representing the unconditional stability boundary
             boundary_line = pg.InfiniteLine(pos=1.0, angle=0, pen=pg.mkPen('r', width=1.5, style=Qt.PenStyle.DashLine))
             self.k_plot_widget.addItem(boundary_line)
         
+        self.btn_cal.setEnabled(True)
         self.btn_sweep.setEnabled(True)
         self.btn_export_vna.setEnabled(True)
         self.status_label.setText("S-Parameter Sweep Complete. Data ready to export.")
@@ -1031,7 +1167,47 @@ class TestExecutiveGUI(QMainWindow):
         self.bias_thread.error_occurred.connect(self.handle_error)
         self.bias_thread.start()
 
+    def trigger_comp_ecal_calibration(self):
+        self.btn_comp_cal.setEnabled(False)
+        self.btn_comp.setEnabled(False)
+        self.btn_export_comp.setEnabled(False)
+        
+        try:
+            f_min = float(self.input_fmin.text())
+            f_max = float(self.input_fmax.text())
+            f_step = float(self.input_fstep.text())
+            power = float(self.input_comp_cal_power.text())
+            
+            points = int(abs(f_max - f_min) / f_step) + 1 if f_step != 0 else 1
+            
+            vna_params = {
+                'f_start': f_min,
+                'f_stop': f_max,
+                'points': points,
+                'power': power,
+                'ifbw': 1000.0, # Default safe IFBW for calibration
+                'avg_enable': False,
+                'avg_factor': 1
+            }
+            
+            self.comp_cal_thread = VNACalWorker(self.vna_combo.currentText(), vna_params)
+            self.comp_cal_thread.log_message.connect(self.status_label.setText)
+            self.comp_cal_thread.error_occurred.connect(self.handle_error)
+            self.comp_cal_thread.sequence_complete.connect(self.on_comp_ecal_complete)
+            self.comp_cal_thread.start()
+            
+        except Exception as e:
+            self.handle_error(f"Failed to parse calibration parameters: {e}")
+
+    def on_comp_ecal_complete(self):
+        self.btn_comp_cal.setEnabled(True)
+        self.btn_comp.setEnabled(True)
+        if self.compression_results:
+            self.btn_export_comp.setEnabled(True)
+        self.status_label.setText("Compression ECal Complete. Ready for Sweep.")
+
     def trigger_compression_sweep(self):
+        self.btn_comp_cal.setEnabled(False)
         self.btn_comp.setEnabled(False)
         self.btn_export_comp.setEnabled(False)
         self.comp_plot.clear()
@@ -1096,6 +1272,7 @@ class TestExecutiveGUI(QMainWindow):
         self.comp_plot.plot(pin, pae, pen=pg.mkPen('m', width=2), symbol='x', name=f"PAE @ {freq/1e9:.2f} GHz (%)")
 
     def on_compression_complete(self):
+        self.btn_comp_cal.setEnabled(True)
         self.btn_comp.setEnabled(True)
         if self.compression_results:
             self.btn_export_comp.setEnabled(True)
@@ -1194,10 +1371,13 @@ class TestExecutiveGUI(QMainWindow):
     def handle_error(self, msg):
         self.status_label.setText(f"ERROR: {msg}")
         self.status_label.setStyleSheet("font-weight: bold; color: #AA0000;")
-        self.btn_sweep.setEnabled(True)
-        self.btn_bias.setEnabled(True)
-        self.btn_comp.setEnabled(True)
-        self.btn_harm.setEnabled(True)
+        # Safely re-enable buttons defensively in case an error occurs before the UI is fully built
+        if hasattr(self, 'btn_cal'): self.btn_cal.setEnabled(True)
+        if hasattr(self, 'btn_sweep'): self.btn_sweep.setEnabled(True)
+        if hasattr(self, 'btn_bias'): self.btn_bias.setEnabled(True)
+        if hasattr(self, 'btn_comp_cal'): self.btn_comp_cal.setEnabled(True)
+        if hasattr(self, 'btn_comp'): self.btn_comp.setEnabled(True)
+        if hasattr(self, 'btn_harm'): self.btn_harm.setEnabled(True)
 
     def global_emergency_kill(self):
         self.status_label.setText("EMERGENCY SHUTDOWN EXECUTED.")
