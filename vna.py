@@ -8,7 +8,30 @@ class VectorNetworkAnalyzer(BaseInstrument):
     """
     def __init__(self, resource_address, name="PNA-X"):
         super().__init__(resource_address, name)
+        # vna.py - Add this method to your VectorNetworkAnalyzer class
 
+    def perform_compression_power_cal(self, port=1):
+        """
+        Performs a Source Power Calibration for Gain Compression testing.
+        This calibrates absolute power accuracy at the specified port.
+        """
+        self.logger.info(f"Initiating Power Calibration on Port {port}")
+        
+        # 1. Select the port for source power calibration
+        self.write(f"SENS1:CORR:POWER:COLL:SEL PORT{port}")
+        
+        # 2. Acquire the power calibration standards (this triggers the PNA-X power cal dialog)
+        # Note: Ensure the PNA-X is physically connected to a power sensor if required,
+        # or ensure 'User Characterization' is properly defined.
+        self.write("SENS1:CORR:POWER:COLL:ACQ")
+        
+        # 3. Wait for the calibration to complete
+        self.write("*OPC?") 
+        
+        # 4. Enable power correction for the measurement
+        self.write("SENS1:CORR:POWER:STAT ON")
+        self.logger.info("Power Calibration Complete and Enabled.")
+        
     def setup_2port_s_parameters(self, start_freq, stop_freq, points, power_dbm):
         """
         Deletes old traces and sets up four new traces for a full 2-port 
